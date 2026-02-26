@@ -30,7 +30,7 @@ func NewJSONFileReader[V any](ttl time.Duration) *JSONFileReader[V] {
 }
 
 func (r *JSONFileReader[V]) load(filename string, timestamp int64) (V, error) {
-	res, err, _ := r.loaderLock.Do(filename, func() (interface{}, error) {
+	res, err, _ := r.loaderLock.Do(filename, func() (any, error) {
 		content, err := os.ReadFile(filename)
 		if err != nil {
 			return nil, err
@@ -66,7 +66,7 @@ func (r *JSONFileReader[V]) Get(filename string) (V, error) {
 
 	item := r.cache.Get(filename)
 	if item == nil {
-		res, err, _ := r.loaderLock.Do(filename, func() (interface{}, error) {
+		res, err, _ := r.loaderLock.Do(filename, func() (any, error) {
 			content, err := os.ReadFile(filename)
 			if err != nil {
 				return nil, err
@@ -100,15 +100,14 @@ func (r *JSONFileReader[V]) Extend(filename string, data V) (V, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			r.cache.Delete(filename)
 		}
-		var v V
-		return v, err
+		return data, err
 	}
 	updated := fStat.ModTime()
 	timestamp := updated.Unix()
 
 	item := r.cache.Get(filename)
 	if item == nil {
-		res, err, _ := r.loaderLock.Do(filename, func() (interface{}, error) {
+		res, err, _ := r.loaderLock.Do(filename, func() (any, error) {
 			content, err := os.ReadFile(filename)
 			if err != nil {
 				return nil, err
@@ -121,11 +120,10 @@ func (r *JSONFileReader[V]) Extend(filename string, data V) (V, error) {
 			r.cache.Set(filename, rec, ttlcache.DefaultTTL)
 			return data, nil
 		})
-		var v V
 		if err != nil {
-			return v, err
+			return data, err
 		}
-		v = res.(V)
+		v := res.(V)
 		return v, nil
 	}
 	rec := item.Value()
