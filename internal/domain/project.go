@@ -203,6 +203,74 @@ type Scripts map[string]ScriptModule
 
 type FilesReader func() (string, io.ReadCloser, error)
 
+// ProcessingServiceType represents the type of processing API.
+type ProcessingServiceType string
+
+const (
+	ProcessingServiceTypeWPS          ProcessingServiceType = "wps"
+	ProcessingServiceTypeOGCProcesses ProcessingServiceType = "ogcapi-processes"
+)
+
+// RemoteConfig describes the remote processing service endpoint.
+type RemoteConfig struct {
+	Type       string            `json:"type"`                  // "wps" or "ogcapi-processes"
+	ExecuteURL string            `json:"execute_url,omitempty"` // override; defaults to {service_url}/processes/{id}/execution
+	Method     string            `json:"method,omitempty"`      // default "POST"
+	StatusURL  string            `json:"status_url,omitempty"`
+	ResultURL  string            `json:"result_url,omitempty"`
+	Headers    map[string]string `json:"headers,omitempty"`
+}
+
+// ExecutionConfig holds execution parameters for the processing proxy.
+type ExecutionConfig struct {
+	Async            bool `json:"async"`
+	PollIntervalSecs int  `json:"poll_interval_seconds,omitempty"`
+	TimeoutSecs      int  `json:"timeout_seconds,omitempty"`
+}
+
+// ProjectInput describes an input to be resolved from a QGIS project layer or a scalar value.
+type ProjectInput struct {
+	InputID   string          `json:"input_id"`
+	Layer     string          `json:"layer,omitempty"`
+	Value     json.RawMessage `json:"value,omitempty"`
+	Selection *InputSelection `json:"selection,omitempty"`
+	Encoding  *InputEncoding  `json:"encoding,omitempty"`
+}
+
+// InputSelection describes how to filter features from a layer.
+type InputSelection struct {
+	Mode       string `json:"mode"`
+	Expression string `json:"expression,omitempty"`
+}
+
+// InputEncoding describes the output format for layer data extraction.
+type InputEncoding struct {
+	Format       string `json:"format"`
+	GeometryOnly bool   `json:"geometry_only"`
+}
+
+// ProcessConfig holds the proxy configuration for a specific process.
+type ProcessConfig struct {
+	Remote          RemoteConfig      `json:"remote"`
+	Execution       ExecutionConfig   `json:"execution"`
+	ProjectInputs   []ProjectInput    `json:"project_inputs,omitempty"`
+	PayloadBindings map[string]string `json:"payload_bindings,omitempty"`
+}
+
+// ProcessingService represents a configured processing backend.
+type ProcessingService struct {
+	ID        string                   `json:"id"`
+	URL       string                   `json:"url"`
+	Type      ProcessingServiceType    `json:"type"`
+	Name      string                   `json:"name,omitempty"`
+	Processes map[string]ProcessConfig `json:"processes,omitempty"`
+}
+
+// ProcessingConfig holds the processing configuration for a project.
+type ProcessingConfig struct {
+	Services []ProcessingService `json:"services"`
+}
+
 type ProjectsRepository interface {
 	CheckProjectExists(name string) bool
 	Create(name string, qmeta json.RawMessage) (*ProjectInfo, error)
@@ -230,6 +298,8 @@ type ProjectsRepository interface {
 	UpdateFiles(projectName string, info FilesChanges, next FilesReader) ([]ProjectFile, error)
 	GetScripts(projectName string) (Scripts, error)
 	UpdateScripts(projectName string, scripts Scripts) error
+	GetProcessingConfig(projectName string) (ProcessingConfig, error)
+	UpdateProcessingConfig(projectName string, cfg ProcessingConfig) error
 	GetProjectCustomizations(projectName string) (json.RawMessage, error)
 	Close()
 }

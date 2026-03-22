@@ -33,8 +33,9 @@ type Config struct {
 	SessionExpiration    time.Duration
 	SignupAPI            bool
 	PluginsURL           string
-	MaxProjectSize       int64
-	ProjectCustomization bool
+	MaxProjectSize        int64
+	ProjectCustomization  bool
+	ProcessingProxySecret string
 }
 
 var extensions = make(map[string]func(s *Server) error, 0)

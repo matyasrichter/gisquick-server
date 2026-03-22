@@ -118,6 +118,9 @@ func Serve() error {
 			ActivationSubject    string `conf:"default:Gisquick Registration"`
 			PasswordResetSubject string `conf:"default:Gisquick Password Reset"`
 		}
+		ProcessingProxy struct {
+			SharedSecret string `conf:"env:PROCESSING_PROXY_SHARED_SECRET,mask"`
+		}
 	}{}
 
 	// const prefix = "GISQUICK"
@@ -209,7 +212,8 @@ func Serve() error {
 		SignupAPI:            cfg.Gisquick.SignupAPI,
 		SiteURL:              cfg.Web.SiteURL,
 		MaxProjectSize:       int64(cfg.Gisquick.ProjectSizeLimit),
-		ProjectCustomization: cfg.Gisquick.ProjectCustomization,
+		ProjectCustomization:  cfg.Gisquick.ProjectCustomization,
+		ProcessingProxySecret: cfg.ProcessingProxy.SharedSecret,
 	}
 
 	// Services

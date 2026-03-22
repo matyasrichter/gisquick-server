@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/gisquick/gisquick-server/internal/domain"
+	"github.com/gisquick/gisquick-server/internal/processing"
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
 )
@@ -141,6 +142,23 @@ func (s *Server) AddRoutes(e *echo.Echo) {
 		e.GET("/plugins/platform/:platform", s.platformPluginRepoHandler("/qgis-plugins-repo"))
 		e.GET("/plugins/download/*", s.handleDownloadPlugin("/qgis-plugins-repo"))
 	}
+
+	// Processing module
+	procHandlers := processing.NewHandlers(s.projects, s.log, s.Config.MapserverURL, s.Config.ProcessingProxySecret)
+	e.POST("/api/project/processing/:user/:name", procHandlers.HandleAddProcessingService(), ProjectAdminAccess)
+	e.PUT("/api/project/processing/:user/:name/:id", procHandlers.HandleUpdateProcessingService(), ProjectAdminAccess)
+	e.DELETE("/api/project/processing/:user/:name/:id", procHandlers.HandleDeleteProcessingService(), ProjectAdminAccess)
+	e.GET("/api/project/processing/:user/:name", procHandlers.HandleGetProcessingConfig(), ProjectAdminAccess)
+
+	// OGC API - Processes proxy endpoints
+	e.GET("/api/map/ogc-processes/:user/:name", procHandlers.HandleLandingPage(), ProjectAccess)
+	e.GET("/api/map/ogc-processes/:user/:name/conformance", procHandlers.HandleConformance(), ProjectAccess)
+	e.GET("/api/map/ogc-processes/:user/:name/processes", procHandlers.HandleProcessList(), ProjectAccess)
+	e.GET("/api/map/ogc-processes/:user/:name/processes/:processId", procHandlers.HandleProcessDescription(), ProjectAccess)
+	e.POST("/api/map/ogc-processes/:user/:name/processes/:processId/execution", procHandlers.HandleExecute(), ProjectAccess)
+	e.GET("/api/map/ogc-processes/:user/:name/jobs/:jobId", procHandlers.HandleJobStatus(), ProjectAccess)
+	e.GET("/api/map/ogc-processes/:user/:name/jobs/:jobId/results", procHandlers.HandleJobResults(), ProjectAccess)
+	e.GET("/api/map/ogc-processes/:user/:name/jobs/:jobId/artifacts/:filename", procHandlers.HandleArtifactDownload(), ProjectAccess)
 
 	// owsHandler := s.owsHandler()
 	// e.GET("/api/map/ows", owsHandler)

@@ -1035,6 +1035,29 @@ func (s *DiskStorage) UpdateScripts(projectName string, scripts domain.Scripts) 
 	return s.saveConfigFile(projectName, "scripts.json", scripts)
 }
 
+func (s *DiskStorage) GetProcessingConfig(projectName string) (domain.ProcessingConfig, error) {
+	var cfg domain.ProcessingConfig
+	file := filepath.Join(s.ProjectsRoot, projectName, ".gisquick", "processing.json")
+	content, err := os.ReadFile(file)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return domain.ProcessingConfig{Services: []domain.ProcessingService{}}, nil
+		}
+		return cfg, err
+	}
+	if err := json.Unmarshal(content, &cfg); err != nil {
+		return cfg, err
+	}
+	if cfg.Services == nil {
+		cfg.Services = []domain.ProcessingService{}
+	}
+	return cfg, nil
+}
+
+func (s *DiskStorage) UpdateProcessingConfig(projectName string, cfg domain.ProcessingConfig) error {
+	return s.saveConfigFile(projectName, "processing.json", cfg)
+}
+
 func (s *DiskStorage) Close() {
 	s.settingsReader.Close()
 	s.projectInfoReader.Close()
