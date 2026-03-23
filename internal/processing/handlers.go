@@ -44,7 +44,12 @@ func baseURL(c echo.Context, projectName string) string {
 	if fwd := c.Request().Header.Get("X-Forwarded-Proto"); fwd != "" {
 		scheme = fwd
 	}
-	return fmt.Sprintf("%s://%s/api/map/ogc-processes/%s", scheme, c.Request().Host, projectName)
+	host := c.Request().Host
+	if fwdHost := c.Request().Header.Get("X-Forwarded-Host"); fwdHost != "" {
+		host = fwdHost
+	}
+
+	return fmt.Sprintf("%s://%s/api/map/ogc-processes/%s", scheme, host, projectName)
 }
 
 // findOGCServiceByID finds an OGC service by its UUID among OGC-type services.
@@ -224,7 +229,6 @@ func (h *Handlers) HandleDeleteProcessingService() echo.HandlerFunc {
 	}
 }
 
-
 // HandleGetProcessingConfig handles GET requests to fetch the processing services configuration.
 func (h *Handlers) HandleGetProcessingConfig() echo.HandlerFunc {
 	return func(c echo.Context) error {
@@ -395,6 +399,8 @@ func (h *Handlers) HandleExecute() echo.HandlerFunc {
 				prefixedJobID := PrefixProcessID(svc.ID, jobID)
 				c.Response().Header().Set("Location", base+"/jobs/"+prefixedJobID)
 			}
+		} else {
+			c.Response().Header().Set("Location", base+"/jobs/"+PrefixProcessID(svc.ID, "unknown"))
 		}
 
 		return h.proxyResponse(c, resp)
