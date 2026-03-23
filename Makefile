@@ -1,10 +1,7 @@
-.PHONY: build test test-processing
+.PHONY: build test
 
 build:
-	go build -o gisquick ./cmd/...
+	go build -o gisquick ./cmd/main.go
 
 test:
 	go test ./...
-
-test-processing:
-	go test -v ./internal/processing/...
