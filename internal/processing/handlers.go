@@ -348,7 +348,6 @@ func (h *Handlers) HandleExecute() echo.HandlerFunc {
 	return func(c echo.Context) error {
 		projectName := c.Get("project").(string)
 		processID := c.Param("processId")
-		base := baseURL(c, projectName)
 
 		svcID, originalID, err := ParsePrefixedID(processID)
 		if err != nil {
@@ -372,38 +371,7 @@ func (h *Handlers) HandleExecute() echo.HandlerFunc {
 		if hasProxyCfg && h.proxySecret != "" && h.mapserverURL != "" {
 			return h.executeViaProxy(c, projectName, svc, originalID, procCfg)
 		}
-
-		// Fallback: forward directly to the backend
-		backendURL := strings.TrimRight(svc.URL, "/") + "/processes/" + originalID + "/execution"
-
-		// Forward relevant headers
-		headers := make(http.Header)
-		if ct := c.Request().Header.Get("Content-Type"); ct != "" {
-			headers.Set("Content-Type", ct)
-		}
-		if prefer := c.Request().Header.Get("Prefer"); prefer != "" {
-			headers.Set("Prefer", prefer)
-		}
-
-		resp, err := h.proxy.ForwardRequest(http.MethodPost, backendURL, c.Request().Body, headers)
-		if err != nil {
-			h.log.Errorw("forwarding execution request", "url", backendURL, zap.Error(err))
-			return echo.NewHTTPError(http.StatusBadGateway, "Failed to reach processing backend")
-		}
-		defer resp.Body.Close()
-
-		// Rewrite Location header for async jobs
-		if location := resp.Header.Get("Location"); location != "" {
-			jobID := extractJobID(location)
-			if jobID != "" {
-				prefixedJobID := PrefixProcessID(svc.ID, jobID)
-				c.Response().Header().Set("Location", base+"/jobs/"+prefixedJobID)
-			}
-		} else {
-			c.Response().Header().Set("Location", base+"/jobs/"+PrefixProcessID(svc.ID, "unknown"))
-		}
-
-		return h.proxyResponse(c, resp)
+		return echo.NewHTTPError(http.StatusInternalServerError, "Processing service is misconfigured")
 	}
 }
 
@@ -457,6 +425,40 @@ func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domai
 		return echo.NewHTTPError(http.StatusBadGateway, "Failed to execute via processing proxy")
 	}
 
+	base := baseURL(c, projectName)
+
+	// Remap jobID to composite svcID:jobID format
+	var prefixedJobID string
+	if result.JobID != "" {
+		prefixedJobID = PrefixProcessID(svc.ID, result.JobID)
+		result.JobID = prefixedJobID
+	}
+
+	// Remap artifact download URLs to our own artifact endpoint
+	for i, artifact := range result.Artifacts {
+		jobForArtifact := prefixedJobID
+		if jobForArtifact == "" && artifact.DownloadURL != "" {
+			// Synchronous execution: extract jobID from the backend download URL
+			if rawID := extractJobID(artifact.DownloadURL); rawID != "" {
+				jobForArtifact = PrefixProcessID(svc.ID, rawID)
+			}
+		}
+		filename := artifact.Filename
+		if filename == "" && artifact.DownloadURL != "" {
+			// Derive filename from the last path segment of the download URL
+			if u, parseErr := url.Parse(artifact.DownloadURL); parseErr == nil {
+				parts := strings.Split(strings.TrimRight(u.Path, "/"), "/")
+				if len(parts) > 0 {
+					filename = parts[len(parts)-1]
+				}
+			}
+		}
+		if jobForArtifact != "" && filename != "" {
+			result.Artifacts[i].DownloadURL = base + "/jobs/" + jobForArtifact + "/artifacts/" + filename
+			result.Artifacts[i].Filename = filename
+		}
+	}
+
 	return c.JSON(http.StatusOK, result)
 }
 
@@ -466,7 +468,7 @@ func (h *Handlers) proxyExecuteURL() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parsing mapserver URL: %w", err)
 	}
-	return fmt.Sprintf("%s://%s/processing-proxy/execute", parsed.Scheme, parsed.Host), nil
+	return fmt.Sprintf("%s://%s/qgis-server/qgis_mapserv.fcgi/ogc/processing-proxy/execute", parsed.Scheme, parsed.Host), nil
 }
 
 // proxyArtifactURL derives the processing proxy artifact URL from the mapserver URL.
@@ -475,22 +477,27 @@ func (h *Handlers) proxyArtifactURL(jobID, filename string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parsing mapserver URL: %w", err)
 	}
-	return fmt.Sprintf("%s://%s/processing-proxy/jobs/%s/%s", parsed.Scheme, parsed.Host, jobID, filename), nil
+	return fmt.Sprintf("%s://%s/qgis-server/qgis_mapserv.fcgi/ogc/processing-proxy/jobs/%s/%s", parsed.Scheme, parsed.Host, jobID, filename), nil
 }
 
 // HandleArtifactDownload proxies artifact download requests to the QGIS Server processing proxy plugin.
 func (h *Handlers) HandleArtifactDownload() echo.HandlerFunc {
 	return func(c echo.Context) error {
-		jobID := c.Param("jobId")
+		jobIDParam := c.Param("jobId")
 		filename := c.Param("filename")
 
 		// Prevent directory traversal
-		if strings.Contains(jobID, "..") || strings.Contains(filename, "..") ||
-			strings.Contains(jobID, "/") || strings.Contains(filename, "/") {
+		if strings.Contains(jobIDParam, "..") || strings.Contains(filename, "..") ||
+			strings.Contains(filename, "/") {
 			return echo.NewHTTPError(http.StatusBadRequest, "Invalid path")
 		}
 
-		artifactURL, err := h.proxyArtifactURL(jobID, filename)
+		_, originalJobID, err := ParsePrefixedID(jobIDParam)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "Invalid job ID format")
+		}
+
+		artifactURL, err := h.proxyArtifactURL(originalJobID, filename)
 		if err != nil {
 			h.log.Errorw("building artifact URL", zap.Error(err))
 			return echo.NewHTTPError(http.StatusInternalServerError, "Processing proxy not configured")
