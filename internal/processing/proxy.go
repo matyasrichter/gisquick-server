@@ -13,7 +13,6 @@ import (
 
 // ProcessProxy abstracts communication with OGC API Processes backends.
 type ProcessProxy interface {
-	FetchProcessList(serviceURL string) ([]ProcessSummary, error)
 	ForwardRequest(method, url string, body io.Reader, headers http.Header) (*http.Response, error)
 	ExecuteViaProxy(ctx context.Context, proxyURL string, req *ProxyExecuteRequest) (*ProxyExecuteResponse, error)
 }
@@ -30,25 +29,6 @@ func NewProxyClient() *ProxyClient {
 			Timeout: 30 * time.Second,
 		},
 	}
-}
-
-// FetchProcessList fetches the process list from a backend service.
-func (p *ProxyClient) FetchProcessList(serviceURL string) ([]ProcessSummary, error) {
-	resp, err := p.httpClient.Get(strings.TrimRight(serviceURL, "/") + "/processes")
-	if err != nil {
-		return nil, fmt.Errorf("fetching process list from %s: %w", serviceURL, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("backend %s returned status %d", serviceURL, resp.StatusCode)
-	}
-
-	var result ProcessList
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decoding process list from %s: %w", serviceURL, err)
-	}
-	return result.Processes, nil
 }
 
 // ForwardRequest forwards an HTTP request to a backend URL and returns the raw response.

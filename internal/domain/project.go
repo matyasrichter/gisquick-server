@@ -251,6 +251,8 @@ type InputEncoding struct {
 
 // ProcessConfig holds the proxy configuration for a specific process.
 type ProcessConfig struct {
+	Title           string            `json:"title,omitempty"`
+	Description     json.RawMessage   `json:"description,omitempty"` // full OGC API process description, stored at registration time
 	Remote          RemoteConfig      `json:"remote"`
 	Execution       ExecutionConfig   `json:"execution"`
 	ProjectInputs   []ProjectInput    `json:"project_inputs,omitempty"`

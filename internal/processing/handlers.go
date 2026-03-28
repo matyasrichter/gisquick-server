@@ -101,6 +101,77 @@ func (r *serviceRequest) toService() domain.ProcessingService {
 	}
 }
 
+// remoteProcessList is used to parse the process list response from an OGC API backend.
+type remoteProcessList struct {
+	Processes []struct {
+		ID string `json:"id"`
+	} `json:"processes"`
+}
+
+// fetchRemoteProcesses retrieves the full process descriptions from an OGC API backend.
+// The returned map is keyed by process ID. Title and Description are populated from the remote;
+// other ProcessConfig fields are left at their zero values for the caller to overlay.
+func (h *Handlers) fetchRemoteProcesses(svcURL string) (map[string]domain.ProcessConfig, error) {
+	base := strings.TrimRight(svcURL, "/")
+
+	resp, err := h.proxy.ForwardRequest(http.MethodGet, base+"/processes", nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetching process list: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("process list returned status %d", resp.StatusCode)
+	}
+
+	var list remoteProcessList
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("decoding process list: %w", err)
+	}
+
+	result := make(map[string]domain.ProcessConfig, len(list.Processes))
+	for _, p := range list.Processes {
+		descResp, err := h.proxy.ForwardRequest(http.MethodGet, base+"/processes/"+p.ID, nil, nil)
+		if err != nil {
+			return nil, fmt.Errorf("fetching process %q: %w", p.ID, err)
+		}
+		defer descResp.Body.Close()
+		if descResp.StatusCode < 200 || descResp.StatusCode >= 300 {
+			return nil, fmt.Errorf("process %q description returned status %d", p.ID, descResp.StatusCode)
+		}
+
+		raw, err := io.ReadAll(descResp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("reading process %q description: %w", p.ID, err)
+		}
+
+		var meta struct {
+			Title string `json:"title"`
+		}
+		_ = json.Unmarshal(raw, &meta)
+
+		result[p.ID] = domain.ProcessConfig{
+			Title:       meta.Title,
+			Description: json.RawMessage(raw),
+		}
+	}
+	return result, nil
+}
+
+// mergeProcessConfigs builds the final process map for a service by starting from the
+// remotely fetched descriptions and overlaying the proxy config from any user-provided overrides.
+func mergeProcessConfigs(fetched map[string]domain.ProcessConfig, overrides map[string]domain.ProcessConfig) map[string]domain.ProcessConfig {
+	for id, override := range overrides {
+		if cfg, ok := fetched[id]; ok {
+			cfg.Remote = override.Remote
+			cfg.Execution = override.Execution
+			cfg.ProjectInputs = override.ProjectInputs
+			cfg.PayloadBindings = override.PayloadBindings
+			fetched[id] = cfg
+		}
+	}
+	return fetched
+}
+
 // HandleAddProcessingService handles POST requests to append a processing service.
 func (h *Handlers) HandleAddProcessingService() echo.HandlerFunc {
 	return func(c echo.Context) error {
@@ -128,19 +199,12 @@ func (h *Handlers) HandleAddProcessingService() echo.HandlerFunc {
 		svc.ID = id.String()
 
 		if svc.Type == domain.ProcessingServiceTypeOGCProcesses {
-			processes, err := h.proxy.FetchProcessList(svc.URL)
+			fetched, err := h.fetchRemoteProcesses(svc.URL)
 			if err != nil {
-				h.log.Warnw("failed to fetch process list", "url", svc.URL, zap.Error(err))
-			} else {
-				if svc.Processes == nil {
-					svc.Processes = make(map[string]domain.ProcessConfig)
-				}
-				for _, p := range processes {
-					if _, exists := svc.Processes[p.ID]; !exists {
-						svc.Processes[p.ID] = domain.ProcessConfig{}
-					}
-				}
+				h.log.Errorw("fetching remote process descriptions", "url", svc.URL, zap.Error(err))
+				return echo.NewHTTPError(http.StatusBadGateway, "Failed to fetch process descriptions from remote")
 			}
+			svc.Processes = mergeProcessConfigs(fetched, req.Processes)
 		}
 
 		cfg.Services = append(cfg.Services, svc)
@@ -186,6 +250,16 @@ func (h *Handlers) HandleUpdateProcessingService() echo.HandlerFunc {
 
 		updated := req.toService()
 		updated.ID = serviceID
+
+		if updated.Type == domain.ProcessingServiceTypeOGCProcesses {
+			fetched, err := h.fetchRemoteProcesses(updated.URL)
+			if err != nil {
+				h.log.Errorw("fetching remote process descriptions", "url", updated.URL, zap.Error(err))
+				return echo.NewHTTPError(http.StatusBadGateway, "Failed to fetch process descriptions from remote")
+			}
+			updated.Processes = mergeProcessConfigs(fetched, req.Processes)
+		}
+
 		cfg.Services[idx] = updated
 
 		if err := h.projects.UpdateProcessingConfig(projectName, cfg); err != nil {
@@ -275,7 +349,7 @@ func (h *Handlers) HandleConformance() echo.HandlerFunc {
 	}
 }
 
-// HandleProcessList returns an aggregated list of processes from all configured backends.
+// HandleProcessList returns an aggregated list of processes from local config.
 func (h *Handlers) HandleProcessList() echo.HandlerFunc {
 	return func(c echo.Context) error {
 		projectName := c.Get("project").(string)
@@ -291,17 +365,15 @@ func (h *Handlers) HandleProcessList() echo.HandlerFunc {
 		var allProcesses []ProcessSummary
 
 		for _, svc := range services {
-			processes, err := h.proxy.FetchProcessList(svc.URL)
-			if err != nil {
-				h.log.Warnw("failed to fetch process list from backend", "service", svc.URL, zap.Error(err))
-				continue
-			}
-			for _, p := range processes {
-				p.ID = PrefixProcessID(svc.ID, p.ID)
-				p.Links = []Link{
-					{Href: base + "/processes/" + p.ID, Rel: "self", Type: "application/json", Title: "Process description"},
-				}
-				allProcesses = append(allProcesses, p)
+			for processID := range svc.Processes {
+				prefixedID := PrefixProcessID(svc.ID, processID)
+				allProcesses = append(allProcesses, ProcessSummary{
+					ID:    prefixedID,
+					Title: svc.Processes[processID].Title,
+					Links: []Link{
+						{Href: base + "/processes/" + prefixedID, Rel: "self", Type: "application/json", Title: "Process description"},
+					},
+				})
 			}
 		}
 		if allProcesses == nil {
@@ -318,26 +390,52 @@ func (h *Handlers) HandleProcessList() echo.HandlerFunc {
 	}
 }
 
-// HandleProcessDescription returns the description of a specific process from its backend.
+// HandleProcessDescription returns the stored description of a specific process.
 func (h *Handlers) HandleProcessDescription() echo.HandlerFunc {
 	return func(c echo.Context) error {
 		projectName := c.Get("project").(string)
 		processID := c.Param("processId")
 
-		svc, originalID, err := h.resolveService(projectName, processID)
+		svcID, originalID, err := ParsePrefixedID(processID)
 		if err != nil {
-			return err
+			return echo.NewHTTPError(http.StatusBadRequest, "Invalid process ID format")
 		}
 
-		backendURL := strings.TrimRight(svc.URL, "/") + "/processes/" + originalID
-		resp, err := h.proxy.ForwardRequest(http.MethodGet, backendURL, nil, nil)
+		cfg, err := h.projects.GetProcessingConfig(projectName)
 		if err != nil {
-			h.log.Errorw("forwarding process description request", "url", backendURL, zap.Error(err))
-			return echo.NewHTTPError(http.StatusBadGateway, "Failed to reach processing backend")
+			h.log.Errorw("reading processing config", "project", projectName, zap.Error(err))
+			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to read processing config")
 		}
-		defer resp.Body.Close()
 
-		return h.proxyResponse(c, resp)
+		services := ogcServices(cfg)
+		svc, found := findOGCServiceByID(services, svcID)
+		if !found {
+			return echo.NewHTTPError(http.StatusNotFound, "Process not found")
+		}
+
+		procCfg, ok := svc.Processes[originalID]
+		if !ok || len(procCfg.Description) == 0 {
+			return echo.NewHTTPError(http.StatusNotFound, "Process description not configured")
+		}
+
+		var desc map[string]json.RawMessage
+		if err := json.Unmarshal(procCfg.Description, &desc); err != nil {
+			h.log.Errorw("parsing stored process description", "process", originalID, zap.Error(err))
+			return echo.NewHTTPError(http.StatusInternalServerError, "Invalid stored process description")
+		}
+
+		prefixedID := PrefixProcessID(svcID, originalID)
+		idBytes, _ := json.Marshal(prefixedID)
+		desc["id"] = json.RawMessage(idBytes)
+
+		base := baseURL(c, projectName)
+		links := []Link{
+			{Href: base + "/processes/" + prefixedID, Rel: "self", Type: "application/json"},
+		}
+		linksBytes, _ := json.Marshal(links)
+		desc["links"] = json.RawMessage(linksBytes)
+
+		return c.JSON(http.StatusOK, desc)
 	}
 }
 
@@ -561,28 +659,6 @@ func (h *Handlers) HandleJobResults() echo.HandlerFunc {
 
 		return h.proxyResponse(c, resp)
 	}
-}
-
-// resolveService looks up the backend service for a prefixed process ID.
-func (h *Handlers) resolveService(projectName, processID string) (domain.ProcessingService, string, error) {
-	svcID, originalID, err := ParsePrefixedID(processID)
-	if err != nil {
-		return domain.ProcessingService{}, "", echo.NewHTTPError(http.StatusBadRequest, "Invalid process ID format")
-	}
-
-	cfg, err := h.projects.GetProcessingConfig(projectName)
-	if err != nil {
-		h.log.Errorw("reading processing config", "project", projectName, zap.Error(err))
-		return domain.ProcessingService{}, "", echo.NewHTTPError(http.StatusInternalServerError, "Failed to read processing config")
-	}
-
-	services := ogcServices(cfg)
-	svc, found := findOGCServiceByID(services, svcID)
-	if !found {
-		return domain.ProcessingService{}, "", echo.NewHTTPError(http.StatusNotFound, "Process not found")
-	}
-
-	return svc, originalID, nil
 }
 
 // resolveServiceByJobID looks up the backend service for a prefixed job ID.

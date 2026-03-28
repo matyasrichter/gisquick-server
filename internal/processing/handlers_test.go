@@ -1,7 +1,9 @@
 package processing
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +14,19 @@ import (
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
 )
+
+// mockProxy is a test double for ProcessProxy.
+type mockProxy struct {
+	forwardFunc func(method, url string, body io.Reader, headers http.Header) (*http.Response, error)
+}
+
+func (m *mockProxy) ForwardRequest(method, url string, body io.Reader, headers http.Header) (*http.Response, error) {
+	return m.forwardFunc(method, url, body, headers)
+}
+
+func (m *mockProxy) ExecuteViaProxy(_ context.Context, _ string, _ *ProxyExecuteRequest) (*ProxyExecuteResponse, error) {
+	return nil, nil
+}
 
 // newTestHandlers creates a Handlers instance suitable for unit tests.
 func newTestHandlers(projects *mock.ProjectService, proxy ProcessProxy) *Handlers {
@@ -164,22 +179,6 @@ func TestHandleAddProcessingServiceWPS(t *testing.T) {
 }
 
 func TestHandleAddProcessingServiceOGC(t *testing.T) {
-	// Real httptest server serving a /processes endpoint
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/processes" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(ProcessList{
-				Processes: []ProcessSummary{
-					{ID: "buffer"},
-					{ID: "clip"},
-				},
-			})
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer ts.Close()
-
 	var saved domain.ProcessingConfig
 	projects := &mock.ProjectService{
 		GetProcessingConfigFunc: func(n string) (domain.ProcessingConfig, error) {
@@ -191,9 +190,29 @@ func TestHandleAddProcessingServiceOGC(t *testing.T) {
 		},
 	}
 
-	h := newTestHandlers(projects, NewProxyClient())
-	body := `{"url":"` + ts.URL + `","type":"ogcapi-processes","name":"OGC"}`
-	c, rec := newEchoCtx(http.MethodPost, "/", body)
+	proxy := &mockProxy{
+		forwardFunc: func(method, url string, body io.Reader, headers http.Header) (*http.Response, error) {
+			if strings.HasSuffix(url, "/processes") && !strings.Contains(url, "/processes/") {
+				listBody := `{"processes":[{"id":"buffer","title":"Buffer"}],"links":[]}`
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(listBody)),
+				}, nil
+			}
+			if strings.HasSuffix(url, "/processes/buffer") {
+				descBody := `{"id":"buffer","title":"Buffer","description":"Computes a buffer around geometries."}`
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(descBody)),
+				}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	h := newTestHandlers(projects, proxy)
+	reqBody := `{"url":"http://ogc.example.com","type":"ogcapi-processes","name":"OGC"}`
+	c, rec := newEchoCtx(http.MethodPost, "/", reqBody)
 
 	if err := h.HandleAddProcessingService()(c); err != nil {
 		t.Fatalf("handler returned error: %v", err)
@@ -208,14 +227,18 @@ func TestHandleAddProcessingServiceOGC(t *testing.T) {
 	if svc.ID == "" {
 		t.Error("expected non-empty service ID")
 	}
-	if len(svc.Processes) != 2 {
-		t.Errorf("expected 2 auto-populated processes, got %d: %v", len(svc.Processes), svc.Processes)
+	if svc.URL != "http://ogc.example.com" || svc.Type != domain.ProcessingServiceTypeOGCProcesses {
+		t.Errorf("unexpected saved service: %+v", svc)
 	}
-	if _, ok := svc.Processes["buffer"]; !ok {
-		t.Error("expected 'buffer' in processes")
+	procCfg, ok := svc.Processes["buffer"]
+	if !ok {
+		t.Fatal("expected 'buffer' process to be stored")
 	}
-	if _, ok := svc.Processes["clip"]; !ok {
-		t.Error("expected 'clip' in processes")
+	if procCfg.Title != "Buffer" {
+		t.Errorf("expected title 'Buffer', got %q", procCfg.Title)
+	}
+	if len(procCfg.Description) == 0 {
+		t.Error("expected non-empty process description to be stored")
 	}
 }
 
