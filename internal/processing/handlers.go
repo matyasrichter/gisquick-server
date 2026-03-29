@@ -6,8 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/gisquick/gisquick-server/internal/application"
 	"github.com/gisquick/gisquick-server/internal/domain"
@@ -16,6 +16,12 @@ import (
 	"go.uber.org/zap"
 )
 
+// jobGeoServices holds the internal WMS/WFS URLs for a completed processing job.
+type jobGeoServices struct {
+	wmsURL string
+	wfsURL string
+}
+
 // Handlers provides HTTP handlers for the processing module.
 type Handlers struct {
 	projects     application.ProjectService
@@ -23,6 +29,8 @@ type Handlers struct {
 	log          *zap.SugaredLogger
 	mapserverURL string
 	proxySecret  string
+	mu           sync.RWMutex
+	jobURLs      map[string]jobGeoServices // prefixedJobID → internal geo service URLs
 }
 
 func NewHandlers(projects application.ProjectService, log *zap.SugaredLogger, mapserverURL, proxySecret string) *Handlers {
@@ -32,6 +40,7 @@ func NewHandlers(projects application.ProjectService, log *zap.SugaredLogger, ma
 		log:          log,
 		mapserverURL: mapserverURL,
 		proxySecret:  proxySecret,
+		jobURLs:      make(map[string]jobGeoServices),
 	}
 }
 
@@ -163,9 +172,6 @@ func mergeProcessConfigs(fetched map[string]domain.ProcessConfig, overrides map[
 	for id, override := range overrides {
 		if cfg, ok := fetched[id]; ok {
 			cfg.Remote = override.Remote
-			cfg.Execution = override.Execution
-			cfg.ProjectInputs = override.ProjectInputs
-			cfg.PayloadBindings = override.PayloadBindings
 			fetched[id] = cfg
 		}
 	}
@@ -490,24 +496,11 @@ func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domai
 		remote.Type = string(svc.Type)
 	}
 
-	// Build project_ref from the project's QGIS file
-	var projectRef *ProjectRef
-	pInfo, err := h.projects.GetProjectInfo(projectName)
-	if err == nil && pInfo.QgisFile != "" {
-		projectRef = &ProjectRef{
-			Map: filepath.Join("/publish", projectName, pInfo.QgisFile),
-		}
-	}
-
 	// Build the proxy request
 	proxyReq := &ProxyExecuteRequest{
-		Auth:            h.proxySecret,
-		Remote:          remote,
-		Execution:       procCfg.Execution,
-		ProjectRef:      projectRef,
-		ProjectInputs:   procCfg.ProjectInputs,
-		PayloadBindings: procCfg.PayloadBindings,
-		Payload:         payload,
+		Auth:    h.proxySecret,
+		Remote:  remote,
+		Payload: payload,
 	}
 
 	// Derive the proxy URL from the mapserver URL
@@ -526,34 +519,39 @@ func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domai
 	base := baseURL(c, projectName)
 
 	// Remap jobID to composite svcID:jobID format
-	var prefixedJobID string
-	if result.JobID != "" {
-		prefixedJobID = PrefixProcessID(svc.ID, result.JobID)
-		result.JobID = prefixedJobID
-	}
+	prefixedJobID := PrefixProcessID(svc.ID, result.JobID)
+	result.JobID = prefixedJobID
 
 	// Remap artifact download URLs to our own artifact endpoint
 	for i, artifact := range result.Artifacts {
-		jobForArtifact := prefixedJobID
-		if jobForArtifact == "" && artifact.DownloadURL != "" {
-			// Synchronous execution: extract jobID from the backend download URL
-			if rawID := extractJobID(artifact.DownloadURL); rawID != "" {
-				jobForArtifact = PrefixProcessID(svc.ID, rawID)
+		if artifact.DownloadURL == "" {
+			continue
+		}
+		var filename string
+		if u, parseErr := url.Parse(artifact.DownloadURL); parseErr == nil {
+			parts := strings.Split(strings.TrimRight(u.Path, "/"), "/")
+			if len(parts) > 0 {
+				filename = parts[len(parts)-1]
 			}
 		}
-		filename := artifact.Filename
-		if filename == "" && artifact.DownloadURL != "" {
-			// Derive filename from the last path segment of the download URL
-			if u, parseErr := url.Parse(artifact.DownloadURL); parseErr == nil {
-				parts := strings.Split(strings.TrimRight(u.Path, "/"), "/")
-				if len(parts) > 0 {
-					filename = parts[len(parts)-1]
-				}
-			}
+		if filename != "" {
+			result.Artifacts[i].DownloadURL = base + "/jobs/" + prefixedJobID + "/artifacts/" + filename
 		}
-		if jobForArtifact != "" && filename != "" {
-			result.Artifacts[i].DownloadURL = base + "/jobs/" + jobForArtifact + "/artifacts/" + filename
-			result.Artifacts[i].Filename = filename
+	}
+
+	// Remap WMS/WFS URLs to our proxy endpoints and store originals in memory
+	if result.WmsURL != "" || result.WfsURL != "" {
+		h.mu.Lock()
+		h.jobURLs[prefixedJobID] = jobGeoServices{
+			wmsURL: result.WmsURL,
+			wfsURL: result.WfsURL,
+		}
+		h.mu.Unlock()
+		if result.WmsURL != "" {
+			result.WmsURL = base + "/jobs/" + prefixedJobID + "/wms"
+		}
+		if result.WfsURL != "" {
+			result.WfsURL = base + "/jobs/" + prefixedJobID + "/wfs"
 		}
 	}
 
@@ -612,6 +610,78 @@ func (h *Handlers) HandleArtifactDownload() echo.HandlerFunc {
 		defer resp.Body.Close()
 
 		return h.proxyResponse(c, resp)
+	}
+}
+
+// proxyGeoService proxies a WMS or WFS request to the internal QGIS Server URL stored for the job.
+// It injects the MAP query parameter from the stored URL while passing through the client's own params.
+func (h *Handlers) proxyGeoService(c echo.Context, jobID, serviceType string) error {
+	if strings.Contains(jobID, "..") {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid job ID")
+	}
+
+	h.mu.RLock()
+	urls, ok := h.jobURLs[jobID]
+	h.mu.RUnlock()
+
+	if !ok {
+		return echo.NewHTTPError(http.StatusNotFound, "Geo service not found for this job")
+	}
+
+	var storedURL string
+	switch serviceType {
+	case "wms":
+		storedURL = urls.wmsURL
+	case "wfs":
+		storedURL = urls.wfsURL
+	}
+	if storedURL == "" {
+		return echo.NewHTTPError(http.StatusNotFound, "Service not available for this job")
+	}
+
+	parsedTarget, err := url.Parse(storedURL)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Invalid stored service URL")
+	}
+
+	// Build final query: start from client params, inject MAP from the stored URL
+	finalQuery := make(url.Values)
+	for k, v := range c.Request().URL.Query() {
+		finalQuery[k] = v
+	}
+	if mapParam := parsedTarget.Query().Get("MAP"); mapParam != "" {
+		finalQuery.Set("MAP", mapParam)
+	}
+
+	finalURL := fmt.Sprintf("%s://%s%s?%s", parsedTarget.Scheme, parsedTarget.Host, parsedTarget.Path, finalQuery.Encode())
+
+	headers := make(http.Header)
+	headers.Set("Authorization", "Token "+h.proxySecret)
+	if ct := c.Request().Header.Get("Content-Type"); ct != "" {
+		headers.Set("Content-Type", ct)
+	}
+
+	resp, err := h.proxy.ForwardRequest(c.Request().Method, finalURL, c.Request().Body, headers)
+	if err != nil {
+		h.log.Errorw("proxying geo service request", "url", finalURL, zap.Error(err))
+		return echo.NewHTTPError(http.StatusBadGateway, "Failed to reach geo service")
+	}
+	defer resp.Body.Close()
+
+	return h.proxyResponse(c, resp)
+}
+
+// HandleWMSProxy proxies WMS requests for a processing job result to the internal QGIS Server.
+func (h *Handlers) HandleWMSProxy() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		return h.proxyGeoService(c, c.Param("jobId"), "wms")
+	}
+}
+
+// HandleWFSProxy proxies WFS requests for a processing job result to the internal QGIS Server.
+func (h *Handlers) HandleWFSProxy() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		return h.proxyGeoService(c, c.Param("jobId"), "wfs")
 	}
 }
 

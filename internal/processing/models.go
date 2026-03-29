@@ -53,36 +53,33 @@ type StatusInfo struct {
 	Extra   json.RawMessage `json:"-"`
 }
 
-// ProxyExecuteRequest is the body sent to the QGIS Server processing proxy plugin.
+// ProxyExecuteRequest is the body sent to the processing proxy.
 type ProxyExecuteRequest struct {
-	Auth            string                 `json:"auth"`
-	Remote          domain.RemoteConfig    `json:"remote"`
-	Execution       domain.ExecutionConfig `json:"execution"`
-	ProjectRef      *ProjectRef            `json:"project_ref,omitempty"`
-	ProjectInputs   []domain.ProjectInput  `json:"project_inputs,omitempty"`
-	PayloadBindings map[string]string      `json:"payload_bindings,omitempty"`
-	Payload         json.RawMessage        `json:"payload"`
+	Auth    string              `json:"auth"`
+	Remote  domain.RemoteConfig `json:"remote"`
+	Payload json.RawMessage     `json:"payload"`
 }
 
-// ProjectRef identifies the QGIS project file for layer data extraction.
-type ProjectRef struct {
-	Map string `json:"map"`
-}
-
-// ProxyExecuteResponse is the response from the processing proxy plugin.
+// ProxyExecuteResponse is the response from the processing proxy.
 type ProxyExecuteResponse struct {
-	Status    string          `json:"status"`
-	JobID     string          `json:"job_id,omitempty"`
-	Outputs   json.RawMessage `json:"outputs,omitempty"`
-	Artifacts []Artifact      `json:"artifacts,omitempty"`
-	Error     string          `json:"error,omitempty"`
+	JobID       string          `json:"job_id,omitempty"`
+	Status      string          `json:"status"`
+	StoragePath string          `json:"storage_path,omitempty"`
+	StatusURL   string          `json:"status_url,omitempty"`
+	Artifacts   []Artifact      `json:"artifacts,omitempty"`
+	ProjectQGZ  string          `json:"project_qgz,omitempty"`
+	WmsURL      string          `json:"wms_url,omitempty"`
+	WfsURL      string          `json:"wfs_url,omitempty"`
+	RemoteTrace json.RawMessage `json:"remote_trace,omitempty"`
 }
 
 // Artifact represents a result file from the processing proxy.
 type Artifact struct {
-	Filename    string `json:"filename"`
+	OutputID    string `json:"output_id,omitempty"`
+	Path        string `json:"path,omitempty"`
 	ContentType string `json:"content_type,omitempty"`
+	SizeBytes   int64  `json:"size_bytes,omitempty"`
+	SourceURL   string `json:"source_url,omitempty"`
+	MediaKind   string `json:"media_kind,omitempty"`
 	DownloadURL string `json:"download_url,omitempty"`
-	WmsURL      string `json:"wms_url,omitempty"`
-	WfsURL      string `json:"wfs_url,omitempty"`
 }

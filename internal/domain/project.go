@@ -221,42 +221,11 @@ type RemoteConfig struct {
 	Headers    map[string]string `json:"headers,omitempty"`
 }
 
-// ExecutionConfig holds execution parameters for the processing proxy.
-type ExecutionConfig struct {
-	Async            bool `json:"async"`
-	PollIntervalSecs int  `json:"poll_interval_seconds,omitempty"`
-	TimeoutSecs      int  `json:"timeout_seconds,omitempty"`
-}
-
-// ProjectInput describes an input to be resolved from a QGIS project layer or a scalar value.
-type ProjectInput struct {
-	InputID   string          `json:"input_id"`
-	Layer     string          `json:"layer,omitempty"`
-	Value     json.RawMessage `json:"value,omitempty"`
-	Selection *InputSelection `json:"selection,omitempty"`
-	Encoding  *InputEncoding  `json:"encoding,omitempty"`
-}
-
-// InputSelection describes how to filter features from a layer.
-type InputSelection struct {
-	Mode       string `json:"mode"`
-	Expression string `json:"expression,omitempty"`
-}
-
-// InputEncoding describes the output format for layer data extraction.
-type InputEncoding struct {
-	Format       string `json:"format"`
-	GeometryOnly bool   `json:"geometry_only"`
-}
-
 // ProcessConfig holds the proxy configuration for a specific process.
 type ProcessConfig struct {
-	Title           string            `json:"title,omitempty"`
-	Description     json.RawMessage   `json:"description,omitempty"` // full OGC API process description, stored at registration time
-	Remote          RemoteConfig      `json:"remote"`
-	Execution       ExecutionConfig   `json:"execution"`
-	ProjectInputs   []ProjectInput    `json:"project_inputs,omitempty"`
-	PayloadBindings map[string]string `json:"payload_bindings,omitempty"`
+	Title       string          `json:"title,omitempty"`
+	Description json.RawMessage `json:"description,omitempty"` // full OGC API process description, stored at registration time
+	Remote      RemoteConfig    `json:"remote"`
 }
 
 // ProcessingService represents a configured processing backend.
