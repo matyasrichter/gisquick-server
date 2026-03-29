@@ -2,12 +2,13 @@ package processing
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/gisquick/gisquick-server/internal/application"
 	"github.com/gisquick/gisquick-server/internal/domain"
@@ -16,12 +17,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// jobGeoServices holds the internal WMS/WFS URLs for a completed processing job.
-type jobGeoServices struct {
-	wmsURL string
-	wfsURL string
-}
-
 // Handlers provides HTTP handlers for the processing module.
 type Handlers struct {
 	projects     application.ProjectService
@@ -29,18 +24,17 @@ type Handlers struct {
 	log          *zap.SugaredLogger
 	mapserverURL string
 	proxySecret  string
-	mu           sync.RWMutex
-	jobURLs      map[string]jobGeoServices // prefixedJobID → internal geo service URLs
+	jobs         JobStore
 }
 
-func NewHandlers(projects application.ProjectService, log *zap.SugaredLogger, mapserverURL, proxySecret string) *Handlers {
+func NewHandlers(projects application.ProjectService, log *zap.SugaredLogger, mapserverURL, proxySecret string, jobs JobStore) *Handlers {
 	return &Handlers{
 		projects:     projects,
 		proxy:        NewProxyClient(),
 		log:          log,
 		mapserverURL: mapserverURL,
 		proxySecret:  proxySecret,
-		jobURLs:      make(map[string]jobGeoServices),
+		jobs:         jobs,
 	}
 }
 
@@ -470,17 +464,23 @@ func (h *Handlers) HandleExecute() echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusNotFound, "Process not found")
 		}
 
+		// Extract username from context (set by auth middleware).
+		var username string
+		if user, ok := c.Get("user").(domain.User); ok {
+			username = user.Username
+		}
+
 		// Check if this process has a proxy configuration
 		procCfg, hasProxyCfg := svc.Processes[originalID]
 		if hasProxyCfg && h.proxySecret != "" && h.mapserverURL != "" {
-			return h.executeViaProxy(c, projectName, svc, originalID, procCfg)
+			return h.executeViaProxy(c, projectName, svc, originalID, procCfg, username)
 		}
 		return echo.NewHTTPError(http.StatusInternalServerError, "Processing service is misconfigured")
 	}
 }
 
 // executeViaProxy routes the execution through the QGIS Server processing proxy plugin.
-func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domain.ProcessingService, processID string, procCfg domain.ProcessConfig) error {
+func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domain.ProcessingService, processID string, procCfg domain.ProcessConfig, username string) error {
 	// Read the client's request body as the payload
 	payload, err := io.ReadAll(c.Request().Body)
 	if err != nil {
@@ -495,6 +495,11 @@ func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domai
 	if remote.Type == "" {
 		remote.Type = string(svc.Type)
 	}
+	// Request async execution so the remote returns a job ID immediately rather than blocking.
+	if remote.Headers == nil {
+		remote.Headers = make(map[string]string)
+	}
+	remote.Headers["Prefer"] = "respond-async"
 
 	// Build the proxy request
 	proxyReq := &ProxyExecuteRequest{
@@ -516,11 +521,15 @@ func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domai
 		return echo.NewHTTPError(http.StatusBadGateway, "Failed to execute via processing proxy")
 	}
 
-	base := baseURL(c, projectName)
+	// Generate our own job UUID — this is what the client will use going forward.
+	jobUUID, err := uuid.NewV4()
+	if err != nil {
+		h.log.Errorw("generating job UUID", zap.Error(err))
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to generate job ID")
+	}
+	ourJobID := jobUUID.String()
 
-	// Remap jobID to composite svcID:jobID format
-	prefixedJobID := PrefixProcessID(svc.ID, result.JobID)
-	result.JobID = prefixedJobID
+	base := baseURL(c, projectName)
 
 	// Remap artifact download URLs to our own artifact endpoint
 	for i, artifact := range result.Artifacts {
@@ -535,26 +544,54 @@ func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domai
 			}
 		}
 		if filename != "" {
-			result.Artifacts[i].DownloadURL = base + "/jobs/" + prefixedJobID + "/artifacts/" + filename
+			result.Artifacts[i].DownloadURL = base + "/jobs/" + ourJobID + "/artifacts/" + filename
 		}
 	}
 
-	// Remap WMS/WFS URLs to our proxy endpoints and store originals in memory
-	if result.WmsURL != "" || result.WfsURL != "" {
-		h.mu.Lock()
-		h.jobURLs[prefixedJobID] = jobGeoServices{
-			wmsURL: result.WmsURL,
-			wfsURL: result.WfsURL,
-		}
-		h.mu.Unlock()
-		if result.WmsURL != "" {
-			result.WmsURL = base + "/jobs/" + prefixedJobID + "/wms"
-		}
-		if result.WfsURL != "" {
-			result.WfsURL = base + "/jobs/" + prefixedJobID + "/wfs"
-		}
+	internalWms := result.WmsURL
+	internalWfs := result.WfsURL
+
+	// Remap WMS/WFS URLs to our proxy endpoints
+	if internalWms != "" {
+		result.WmsURL = base + "/jobs/" + ourJobID + "/wms"
+	}
+	if internalWfs != "" {
+		result.WfsURL = base + "/jobs/" + ourJobID + "/wfs"
 	}
 
+	// If the proxy didn't return a StatusURL (e.g. synchronous execution), construct one.
+	statusURL := result.StatusURL
+	if statusURL == "" {
+		statusURL = strings.TrimRight(svc.URL, "/") + "/jobs/" + result.JobID
+	}
+
+	// Persist the job record in Redis with a 24-hour TTL.
+	record := &JobRecord{
+		Version:        1,
+		JobID:          ourJobID,
+		RemoteJobID:    result.JobID,
+		ServiceID:      svc.ID,
+		ProcessID:      processID,
+		ProcessTitle:   procCfg.Title,
+		Project:        projectName,
+		Username:       username,
+		Status:         result.Status,
+		StatusURL:      statusURL,
+		StoragePath:    result.StoragePath,
+		CreatedAt:      time.Now().UTC(),
+		Artifacts:      result.Artifacts,
+		WmsURL:         result.WmsURL,
+		WfsURL:         result.WfsURL,
+		InternalWmsURL: internalWms,
+		InternalWfsURL: internalWfs,
+	}
+	if err := h.jobs.Save(c.Request().Context(), record); err != nil {
+		h.log.Errorw("saving job record to Redis", "jobID", ourJobID, zap.Error(err))
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to persist job record")
+	}
+
+	// Return our job ID to the client (replaces the remote job ID).
+	result.JobID = ourJobID
 	return c.JSON(http.StatusOK, result)
 }
 
@@ -588,12 +625,12 @@ func (h *Handlers) HandleArtifactDownload() echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, "Invalid path")
 		}
 
-		_, originalJobID, err := ParsePrefixedID(jobIDParam)
+		record, err := h.lookupJob(c, jobIDParam)
 		if err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, "Invalid job ID format")
+			return err
 		}
 
-		artifactURL, err := h.proxyArtifactURL(originalJobID, filename)
+		artifactURL, err := h.proxyArtifactURL(record.RemoteJobID, filename)
 		if err != nil {
 			h.log.Errorw("building artifact URL", zap.Error(err))
 			return echo.NewHTTPError(http.StatusInternalServerError, "Processing proxy not configured")
@@ -620,23 +657,25 @@ func (h *Handlers) proxyGeoService(c echo.Context, jobID, serviceType string) er
 		return echo.NewHTTPError(http.StatusBadRequest, "Invalid job ID")
 	}
 
-	h.mu.RLock()
-	urls, ok := h.jobURLs[jobID]
-	h.mu.RUnlock()
-
-	if !ok {
-		return echo.NewHTTPError(http.StatusNotFound, "Geo service not found for this job")
+	record, err := h.lookupJob(c, jobID)
+	if err != nil {
+		return err
 	}
 
 	var storedURL string
 	switch serviceType {
 	case "wms":
-		storedURL = urls.wmsURL
+		storedURL = record.InternalWmsURL
 	case "wfs":
-		storedURL = urls.wfsURL
+		storedURL = record.InternalWfsURL
 	}
 	if storedURL == "" {
 		return echo.NewHTTPError(http.StatusNotFound, "Service not available for this job")
+	}
+	parsedUrl, err := url.Parse(storedURL)
+	if err != nil {
+		h.log.Errorw("parsing stored service URL", "url", storedURL, zap.Error(err))
+		return echo.NewHTTPError(http.StatusInternalServerError, "Invalid stored service URL")
 	}
 
 	parsedTarget, err := url.Parse(storedURL)
@@ -645,7 +684,7 @@ func (h *Handlers) proxyGeoService(c echo.Context, jobID, serviceType string) er
 	}
 
 	// Build final query: start from client params, inject MAP from the stored URL
-	finalQuery := make(url.Values)
+	finalQuery := parsedUrl.Query()
 	for k, v := range c.Request().URL.Query() {
 		finalQuery[k] = v
 	}
@@ -685,21 +724,19 @@ func (h *Handlers) HandleWFSProxy() echo.HandlerFunc {
 	}
 }
 
-// HandleJobStatus forwards a job status request to the appropriate backend.
+// HandleJobStatus forwards a job status request to the remote backend using the stored StatusURL.
 func (h *Handlers) HandleJobStatus() echo.HandlerFunc {
 	return func(c echo.Context) error {
-		projectName := c.Get("project").(string)
 		jobID := c.Param("jobId")
 
-		svc, originalJobID, err := h.resolveServiceByJobID(projectName, jobID)
+		record, err := h.lookupJob(c, jobID)
 		if err != nil {
 			return err
 		}
 
-		backendURL := strings.TrimRight(svc.URL, "/") + "/jobs/" + originalJobID
-		resp, err := h.proxy.ForwardRequest(http.MethodGet, backendURL, nil, nil)
+		resp, err := h.proxy.ForwardRequest(http.MethodGet, record.StatusURL, nil, nil)
 		if err != nil {
-			h.log.Errorw("forwarding job status request", "url", backendURL, zap.Error(err))
+			h.log.Errorw("forwarding job status request", "url", record.StatusURL, zap.Error(err))
 			return echo.NewHTTPError(http.StatusBadGateway, "Failed to reach processing backend")
 		}
 		defer resp.Body.Close()
@@ -708,49 +745,49 @@ func (h *Handlers) HandleJobStatus() echo.HandlerFunc {
 	}
 }
 
-// HandleJobResults forwards a job results request to the appropriate backend.
+// HandleJobResults returns the stored artifacts and geo-service URLs for a completed job.
 func (h *Handlers) HandleJobResults() echo.HandlerFunc {
 	return func(c echo.Context) error {
-		projectName := c.Get("project").(string)
 		jobID := c.Param("jobId")
 
-		svc, originalJobID, err := h.resolveServiceByJobID(projectName, jobID)
+		record, err := h.lookupJob(c, jobID)
 		if err != nil {
 			return err
 		}
 
-		backendURL := strings.TrimRight(svc.URL, "/") + "/jobs/" + originalJobID + "/results"
-		resp, err := h.proxy.ForwardRequest(http.MethodGet, backendURL, nil, nil)
-		if err != nil {
-			h.log.Errorw("forwarding job results request", "url", backendURL, zap.Error(err))
-			return echo.NewHTTPError(http.StatusBadGateway, "Failed to reach processing backend")
+		type jobResults struct {
+			Artifacts []Artifact `json:"artifacts"`
+			WmsURL    string     `json:"wms_url,omitempty"`
+			WfsURL    string     `json:"wfs_url,omitempty"`
 		}
-		defer resp.Body.Close()
-
-		return h.proxyResponse(c, resp)
+		artifacts := record.Artifacts
+		if artifacts == nil {
+			artifacts = []Artifact{}
+		}
+		return c.JSON(http.StatusOK, jobResults{
+			Artifacts: artifacts,
+			WmsURL:    record.WmsURL,
+			WfsURL:    record.WfsURL,
+		})
 	}
 }
 
-// resolveServiceByJobID looks up the backend service for a prefixed job ID.
-func (h *Handlers) resolveServiceByJobID(projectName, jobID string) (domain.ProcessingService, string, error) {
-	svcID, originalJobID, err := ParsePrefixedID(jobID)
+// lookupJob retrieves a JobRecord from Redis, verifying the project scope matches the URL.
+func (h *Handlers) lookupJob(c echo.Context, jobID string) (*JobRecord, error) {
+	project := c.Get("project").(string)
+	record, err := h.jobs.Get(c.Request().Context(), project, jobID)
+	if errors.Is(err, ErrJobNotFound) {
+		return nil, echo.NewHTTPError(http.StatusNotFound, "Job not found")
+	}
 	if err != nil {
-		return domain.ProcessingService{}, "", echo.NewHTTPError(http.StatusBadRequest, "Invalid job ID format")
+		h.log.Errorw("Redis job lookup", "jobID", jobID, zap.Error(err))
+		return nil, echo.NewHTTPError(http.StatusInternalServerError, "Failed to look up job")
 	}
-
-	cfg, err := h.projects.GetProcessingConfig(projectName)
-	if err != nil {
-		h.log.Errorw("reading processing config", "project", projectName, zap.Error(err))
-		return domain.ProcessingService{}, "", echo.NewHTTPError(http.StatusInternalServerError, "Failed to read processing config")
+	// Defense-in-depth: the Redis key already scopes by project, but verify explicitly.
+	if record.Project != project {
+		return nil, echo.NewHTTPError(http.StatusNotFound, "Job not found")
 	}
-
-	services := ogcServices(cfg)
-	svc, found := findOGCServiceByID(services, svcID)
-	if !found {
-		return domain.ProcessingService{}, "", echo.NewHTTPError(http.StatusNotFound, "Job not found")
-	}
-
-	return svc, originalJobID, nil
+	return record, nil
 }
 
 // proxyResponse writes the backend response to the client.
@@ -769,18 +806,6 @@ func (h *Handlers) proxyResponse(c echo.Context, resp *http.Response) error {
 		return err
 	}
 	return nil
-}
-
-// extractJobID extracts the job ID from a Location header URL.
-// Expects a URL ending in /jobs/{jobID} or /jobs/{jobID}/...
-func extractJobID(location string) string {
-	parts := strings.Split(strings.TrimRight(location, "/"), "/")
-	for i, p := range parts {
-		if p == "jobs" && i+1 < len(parts) {
-			return parts[i+1]
-		}
-	}
-	return ""
 }
 
 // MarshalJSON implements custom JSON marshaling for StatusInfo to include extra fields.

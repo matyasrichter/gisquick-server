@@ -28,12 +28,37 @@ func (m *mockProxy) ExecuteViaProxy(_ context.Context, _ string, _ *ProxyExecute
 	return nil, nil
 }
 
+// mockJobStore is an in-memory JobStore for use in tests.
+type mockJobStore struct {
+	records map[string]*JobRecord
+}
+
+func (m *mockJobStore) Save(_ context.Context, r *JobRecord) error {
+	if m.records == nil {
+		m.records = make(map[string]*JobRecord)
+	}
+	m.records[r.Project+":"+r.JobID] = r
+	return nil
+}
+
+func (m *mockJobStore) Get(_ context.Context, project, jobID string) (*JobRecord, error) {
+	if m.records == nil {
+		return nil, ErrJobNotFound
+	}
+	r, ok := m.records[project+":"+jobID]
+	if !ok {
+		return nil, ErrJobNotFound
+	}
+	return r, nil
+}
+
 // newTestHandlers creates a Handlers instance suitable for unit tests.
 func newTestHandlers(projects *mock.ProjectService, proxy ProcessProxy) *Handlers {
 	return &Handlers{
 		projects: projects,
 		proxy:    proxy,
 		log:      zap.NewNop().Sugar(),
+		jobs:     &mockJobStore{},
 	}
 }
 
@@ -76,20 +101,6 @@ func TestParsePrefixedID(t *testing.T) {
 	}
 }
 
-func TestExtractJobID(t *testing.T) {
-	// normal jobs URL
-	if id := extractJobID("http://example.com/jobs/abc123"); id != "abc123" {
-		t.Errorf("expected 'abc123', got %q", id)
-	}
-	// trailing path after job id
-	if id := extractJobID("http://example.com/jobs/xyz/results"); id != "xyz" {
-		t.Errorf("expected 'xyz', got %q", id)
-	}
-	// no jobs segment
-	if id := extractJobID("http://example.com/processes/buffer"); id != "" {
-		t.Errorf("expected empty string, got %q", id)
-	}
-}
 
 func TestServiceRequestValidate(t *testing.T) {
 	cases := []struct {

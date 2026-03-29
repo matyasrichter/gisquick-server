@@ -2,6 +2,7 @@ package processing
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/gisquick/gisquick-server/internal/domain"
 )
@@ -82,4 +83,25 @@ type Artifact struct {
 	SourceURL   string `json:"source_url,omitempty"`
 	MediaKind   string `json:"media_kind,omitempty"`
 	DownloadURL string `json:"download_url,omitempty"`
+}
+
+// JobRecord is the job metadata persisted in Redis for each submitted processing job.
+type JobRecord struct {
+	Version        int        `json:"version"`                    // Schema version, currently 1
+	JobID          string     `json:"job_id"`                     // Our generated UUID (suffix of the Redis key)
+	RemoteJobID    string     `json:"remote_job_id"`              // Remote backend job ID
+	ServiceID      string     `json:"service_id"`                 // UUID of the ProcessingService config
+	ProcessID      string     `json:"process_id"`                 // Original process ID without prefix
+	ProcessTitle   string     `json:"process_title,omitempty"`    // Human-readable process name
+	Project        string     `json:"project"`                    // "user/project"
+	Username       string     `json:"username,omitempty"`         // User who submitted the job
+	Status         string     `json:"status"`                     // Status at submission time
+	StatusURL      string     `json:"status_url"`                 // Remote URL to poll for status
+	StoragePath    string     `json:"storage_path,omitempty"`     // Internal QGIS artifact storage path
+	CreatedAt      time.Time  `json:"created_at"`
+	Artifacts      []Artifact `json:"artifacts"`                  // Our remapped download URLs
+	WmsURL         string     `json:"wms_url,omitempty"`          // Our WMS proxy URL
+	WfsURL         string     `json:"wfs_url,omitempty"`          // Our WFS proxy URL
+	InternalWmsURL string     `json:"internal_wms_url,omitempty"` // Internal QGIS Server WMS URL for proxying
+	InternalWfsURL string     `json:"internal_wfs_url,omitempty"` // Internal QGIS Server WFS URL for proxying
 }
