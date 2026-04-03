@@ -365,11 +365,24 @@ func (h *Handlers) HandleProcessList() echo.HandlerFunc {
 		var allProcesses []ProcessSummary
 
 		for _, svc := range services {
-			for processID := range svc.Processes {
+			for processID, procCfg := range svc.Processes {
 				prefixedID := PrefixProcessID(svc.ID, processID)
+
+				var summaryFields struct {
+					Version  string   `json:"version"`
+					Keywords []string `json:"keywords"`
+				}
+				if len(procCfg.Description) > 0 {
+					json.Unmarshal(procCfg.Description, &summaryFields)
+				}
+
 				allProcesses = append(allProcesses, ProcessSummary{
-					ID:    prefixedID,
-					Title: svc.Processes[processID].Title,
+					ID:                 prefixedID,
+					Title:              procCfg.Title,
+					Version:            summaryFields.Version,
+					Keywords:           summaryFields.Keywords,
+					JobControlOptions:  []string{"async-execute"},
+					OutputTransmission: []string{"reference"},
 					Links: []Link{
 						{Href: base + "/processes/" + prefixedID, Rel: "self", Type: "application/json", Title: "Process description"},
 					},
@@ -549,14 +562,14 @@ func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domai
 	}
 
 	internalWms := result.WmsURL
-	internalWfs := result.WfsURL
+	internalOgcApiFeatures := result.OgcApiFeaturesURL
 
-	// Remap WMS/WFS URLs to our proxy endpoints
+	// Remap WMS/OGC API Features URLs to our proxy endpoints
 	if internalWms != "" {
 		result.WmsURL = base + "/jobs/" + ourJobID + "/wms"
 	}
-	if internalWfs != "" {
-		result.WfsURL = base + "/jobs/" + ourJobID + "/wfs"
+	if internalOgcApiFeatures != "" {
+		result.OgcApiFeaturesURL = base + "/jobs/" + ourJobID + "/ogcapi-features"
 	}
 
 	// If the proxy didn't return a StatusURL (e.g. synchronous execution), construct one.
@@ -567,32 +580,67 @@ func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domai
 
 	// Persist the job record in Redis with a 24-hour TTL.
 	record := &JobRecord{
-		Version:        1,
-		JobID:          ourJobID,
-		RemoteJobID:    result.JobID,
-		ServiceID:      svc.ID,
-		ProcessID:      processID,
-		ProcessTitle:   procCfg.Title,
-		Project:        projectName,
-		Username:       username,
-		Status:         result.Status,
-		StatusURL:      statusURL,
-		StoragePath:    result.StoragePath,
-		CreatedAt:      time.Now().UTC(),
-		Artifacts:      result.Artifacts,
-		WmsURL:         result.WmsURL,
-		WfsURL:         result.WfsURL,
-		InternalWmsURL: internalWms,
-		InternalWfsURL: internalWfs,
+		Version:                   1,
+		JobID:                     ourJobID,
+		RemoteJobID:               result.JobID,
+		ServiceID:                 svc.ID,
+		ProcessID:                 processID,
+		ProcessTitle:              procCfg.Title,
+		Project:                   projectName,
+		Username:                  username,
+		Status:                    result.Status,
+		StatusURL:                 statusURL,
+		StoragePath:               result.StoragePath,
+		CreatedAt:                 time.Now().UTC(),
+		Artifacts:                 result.Artifacts,
+		WmsURL:                    result.WmsURL,
+		OgcApiFeaturesURL:         result.OgcApiFeaturesURL,
+		InternalWmsURL:            internalWms,
+		InternalOgcApiFeaturesURL: internalOgcApiFeatures,
 	}
 	if err := h.jobs.Save(c.Request().Context(), record); err != nil {
 		h.log.Errorw("saving job record to Redis", "jobID", ourJobID, zap.Error(err))
 		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to persist job record")
 	}
 
-	// Return our job ID to the client (replaces the remote job ID).
-	result.JobID = ourJobID
-	return c.JSON(http.StatusOK, result)
+	// Build an OGC API-compliant response with links.
+	jobBase := base + "/jobs/" + ourJobID
+	links := []Link{
+		{Href: jobBase, Rel: "self", Type: "application/json", Title: "Job status"},
+	}
+	for _, artifact := range result.Artifacts {
+		links = append(links, Link{
+			Href:  artifact.DownloadURL,
+			Rel:   "http://www.opengis.net/def/rel/ogc/1.0/results",
+			Type:  artifact.ContentType,
+			Title: artifact.OutputID,
+		})
+	}
+	if result.WmsURL != "" {
+		links = append(links, Link{
+			Href:  result.WmsURL,
+			Rel:   "http://www.opengis.net/def/rel/ogc/1.0/results",
+			Type:  "application/vnd.ogc.wms_xml",
+			Title: "WMS",
+		})
+	}
+	if result.OgcApiFeaturesURL != "" {
+		links = append(links, Link{
+			Href:  result.OgcApiFeaturesURL,
+			Rel:   "http://www.opengis.net/def/rel/ogc/1.0/results",
+			Type:  "application/json",
+			Title: "OGC API Features",
+		})
+	}
+	resp := StatusInfo{
+		ProcessID: PrefixProcessID(svc.ID, processID),
+		JobID:     ourJobID,
+		Type:      "process",
+		Status:    result.Status,
+		Links:     links,
+	}
+	c.Response().Header().Set("Location", jobBase)
+	return c.JSON(http.StatusCreated, resp)
 }
 
 // proxyExecuteURL derives the processing proxy execute URL from the mapserver URL.
@@ -666,8 +714,8 @@ func (h *Handlers) proxyGeoService(c echo.Context, jobID, serviceType string) er
 	switch serviceType {
 	case "wms":
 		storedURL = record.InternalWmsURL
-	case "wfs":
-		storedURL = record.InternalWfsURL
+	case "ogcapi-features":
+		storedURL = record.InternalOgcApiFeaturesURL
 	}
 	if storedURL == "" {
 		return echo.NewHTTPError(http.StatusNotFound, "Service not available for this job")
@@ -717,14 +765,14 @@ func (h *Handlers) HandleWMSProxy() echo.HandlerFunc {
 	}
 }
 
-// HandleWFSProxy proxies WFS requests for a processing job result to the internal QGIS Server.
-func (h *Handlers) HandleWFSProxy() echo.HandlerFunc {
+// HandleOgcApiFeaturesProxy proxies OGC API Features requests for a processing job result to the internal QGIS Server.
+func (h *Handlers) HandleOgcApiFeaturesProxy() echo.HandlerFunc {
 	return func(c echo.Context) error {
-		return h.proxyGeoService(c, c.Param("jobId"), "wfs")
+		return h.proxyGeoService(c, c.Param("jobId"), "ogcapi-features")
 	}
 }
 
-// HandleJobStatus forwards a job status request to the remote backend using the stored StatusURL.
+// HandleJobStatus fetches the job status from the remote backend and returns a conformant statusInfo response.
 func (h *Handlers) HandleJobStatus() echo.HandlerFunc {
 	return func(c echo.Context) error {
 		jobID := c.Param("jobId")
@@ -741,7 +789,53 @@ func (h *Handlers) HandleJobStatus() echo.HandlerFunc {
 		}
 		defer resp.Body.Close()
 
-		return h.proxyResponse(c, resp)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			h.log.Errorw("reading remote status response", zap.Error(err))
+			return echo.NewHTTPError(http.StatusBadGateway, "Failed to read remote status")
+		}
+
+		var remoteStatus struct {
+			Status   string     `json:"status"`
+			Message  string     `json:"message"`
+			Created  *time.Time `json:"created"`
+			Started  *time.Time `json:"started"`
+			Finished *time.Time `json:"finished"`
+			Updated  *time.Time `json:"updated"`
+			Progress *int       `json:"progress"`
+		}
+		if err := json.Unmarshal(body, &remoteStatus); err != nil {
+			h.log.Errorw("parsing remote status response", zap.Error(err))
+			return echo.NewHTTPError(http.StatusBadGateway, "Invalid remote status response")
+		}
+
+		base := baseURL(c, record.Project)
+		jobBase := base + "/jobs/" + jobID
+		links := []Link{
+			{Href: jobBase, Rel: "self", Type: "application/json", Title: "Job status"},
+		}
+		if remoteStatus.Status == "successful" {
+			links = append(links, Link{
+				Href:  jobBase + "/results",
+				Rel:   "http://www.opengis.net/def/rel/ogc/1.0/results",
+				Type:  "application/json",
+				Title: "Job results",
+			})
+		}
+
+		return c.JSON(http.StatusOK, StatusInfo{
+			ProcessID: PrefixProcessID(record.ServiceID, record.ProcessID),
+			JobID:     jobID,
+			Type:      "process",
+			Status:    remoteStatus.Status,
+			Message:   remoteStatus.Message,
+			Created:   remoteStatus.Created,
+			Started:   remoteStatus.Started,
+			Finished:  remoteStatus.Finished,
+			Updated:   remoteStatus.Updated,
+			Progress:  remoteStatus.Progress,
+			Links:     links,
+		})
 	}
 }
 
@@ -756,18 +850,18 @@ func (h *Handlers) HandleJobResults() echo.HandlerFunc {
 		}
 
 		type jobResults struct {
-			Artifacts []Artifact `json:"artifacts"`
-			WmsURL    string     `json:"wms_url,omitempty"`
-			WfsURL    string     `json:"wfs_url,omitempty"`
+			Artifacts         []Artifact `json:"artifacts"`
+			WmsURL            string     `json:"wms_url,omitempty"`
+			OgcApiFeaturesURL string     `json:"ogcapi_features_url,omitempty"`
 		}
 		artifacts := record.Artifacts
 		if artifacts == nil {
 			artifacts = []Artifact{}
 		}
 		return c.JSON(http.StatusOK, jobResults{
-			Artifacts: artifacts,
-			WmsURL:    record.WmsURL,
-			WfsURL:    record.WfsURL,
+			Artifacts:         artifacts,
+			WmsURL:            record.WmsURL,
+			OgcApiFeaturesURL: record.OgcApiFeaturesURL,
 		})
 	}
 }

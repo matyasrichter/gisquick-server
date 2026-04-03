@@ -31,11 +31,14 @@ type ConformanceDeclaration struct {
 
 // ProcessSummary is a summary of a process in the process list.
 type ProcessSummary struct {
-	ID          string `json:"id"`
-	Title       string `json:"title,omitempty"`
-	Description string `json:"description,omitempty"`
-	Version     string `json:"version,omitempty"`
-	Links       []Link `json:"links,omitempty"`
+	ID                 string   `json:"id"`
+	Title              string   `json:"title,omitempty"`
+	Description        string   `json:"description,omitempty"`
+	Keywords           []string `json:"keywords,omitempty"`
+	Version            string   `json:"version"` // required by OGC API processSummary schema
+	JobControlOptions  []string `json:"jobControlOptions,omitempty"`
+	OutputTransmission []string `json:"outputTransmission,omitempty"`
+	Links              []Link   `json:"links,omitempty"`
 }
 
 // ProcessList is the response for the process list endpoint.
@@ -46,12 +49,18 @@ type ProcessList struct {
 
 // StatusInfo represents the status of a job.
 type StatusInfo struct {
-	JobID   string          `json:"jobID"`
-	Status  string          `json:"status"`
-	Type    string          `json:"type,omitempty"`
-	Message string          `json:"message,omitempty"`
-	Links   []Link          `json:"links,omitempty"`
-	Extra   json.RawMessage `json:"-"`
+	ProcessID string          `json:"processID,omitempty"`
+	JobID     string          `json:"jobID"`
+	Type      string          `json:"type"`              // required by OGC API statusInfo schema — always "process"
+	Status    string          `json:"status"`
+	Message   string          `json:"message,omitempty"`
+	Created   *time.Time      `json:"created,omitempty"`
+	Started   *time.Time      `json:"started,omitempty"`
+	Finished  *time.Time      `json:"finished,omitempty"`
+	Updated   *time.Time      `json:"updated,omitempty"`
+	Progress  *int            `json:"progress,omitempty"`
+	Links     []Link          `json:"links,omitempty"`
+	Extra     json.RawMessage `json:"-"`
 }
 
 // ProxyExecuteRequest is the body sent to the processing proxy.
@@ -69,8 +78,8 @@ type ProxyExecuteResponse struct {
 	StatusURL   string          `json:"status_url,omitempty"`
 	Artifacts   []Artifact      `json:"artifacts,omitempty"`
 	ProjectQGZ  string          `json:"project_qgz,omitempty"`
-	WmsURL      string          `json:"wms_url,omitempty"`
-	WfsURL      string          `json:"wfs_url,omitempty"`
+	WmsURL            string          `json:"wms_url,omitempty"`
+	OgcApiFeaturesURL string          `json:"ogcapi_features_url,omitempty"`
 	RemoteTrace json.RawMessage `json:"remote_trace,omitempty"`
 }
 
@@ -100,8 +109,8 @@ type JobRecord struct {
 	StoragePath    string     `json:"storage_path,omitempty"`     // Internal QGIS artifact storage path
 	CreatedAt      time.Time  `json:"created_at"`
 	Artifacts      []Artifact `json:"artifacts"`                  // Our remapped download URLs
-	WmsURL         string     `json:"wms_url,omitempty"`          // Our WMS proxy URL
-	WfsURL         string     `json:"wfs_url,omitempty"`          // Our WFS proxy URL
-	InternalWmsURL string     `json:"internal_wms_url,omitempty"` // Internal QGIS Server WMS URL for proxying
-	InternalWfsURL string     `json:"internal_wfs_url,omitempty"` // Internal QGIS Server WFS URL for proxying
+	WmsURL                    string     `json:"wms_url,omitempty"`                     // Our WMS proxy URL
+	OgcApiFeaturesURL         string     `json:"ogcapi_features_url,omitempty"`         // Our OGC API Features proxy URL
+	InternalWmsURL            string     `json:"internal_wms_url,omitempty"`            // Internal QGIS Server WMS URL for proxying
+	InternalOgcApiFeaturesURL string     `json:"internal_ogcapi_features_url,omitempty"` // Internal QGIS Server OGC API Features URL for proxying
 }
