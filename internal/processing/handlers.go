@@ -650,8 +650,7 @@ func (h *Handlers) runJob(projectName, jobID, base string, remote domain.RemoteC
 	record.Artifacts = artifacts
 	record.FinishedAt = &now
 	if projectFile != "" {
-		record.WmsURL = jobBase + "/ows?SERVICE=WMS"
-		record.WfsURL = jobBase + "/ows?SERVICE=WFS"
+		record.OwsURL = jobBase + "/ows"
 	}
 	if saveErr := h.jobs.Save(ctx, record); saveErr != nil {
 		h.log.Errorw("saving completed job record", "jobID", jobID, zap.Error(saveErr))
@@ -723,8 +722,7 @@ func (h *Handlers) HandleJobResults() echo.HandlerFunc {
 
 		type jobResults struct {
 			Artifacts []Artifact `json:"artifacts"`
-			WmsURL    string     `json:"wms_url,omitempty"`
-			WfsURL    string     `json:"wfs_url,omitempty"`
+			OwsURL    string     `json:"ows_url,omitempty"`
 		}
 		artifacts := record.Artifacts
 		if artifacts == nil {
@@ -732,8 +730,7 @@ func (h *Handlers) HandleJobResults() echo.HandlerFunc {
 		}
 		return c.JSON(http.StatusOK, jobResults{
 			Artifacts: artifacts,
-			WmsURL:    record.WmsURL,
-			WfsURL:    record.WfsURL,
+			OwsURL:    record.OwsURL,
 		})
 	}
 }

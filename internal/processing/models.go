@@ -49,7 +49,7 @@ type ProcessList struct {
 type StatusInfo struct {
 	ProcessID string          `json:"processID,omitempty"`
 	JobID     string          `json:"jobID"`
-	Type      string          `json:"type"`   // required by OGC API statusInfo schema — always "process"
+	Type      string          `json:"type"` // required by OGC API statusInfo schema — always "process"
 	Status    string          `json:"status"`
 	Message   string          `json:"message,omitempty"`
 	Created   *time.Time      `json:"created,omitempty"`
@@ -107,8 +107,7 @@ type JobRecord struct {
 	CreatedAt    time.Time  `json:"created_at"`
 	FinishedAt   *time.Time `json:"finished_at,omitempty"` // Set when background goroutine completes
 	Artifacts    []Artifact `json:"artifacts"`             // Artifacts with client-facing download URLs
-	WmsURL string `json:"wms_url,omitempty"` // Our WMS proxy URL (client-facing)
-	WfsURL string `json:"wfs_url,omitempty"` // Our WFS proxy URL (client-facing)
+	OwsURL       string     `json:"ows_url,omitempty"`     // Our OWS proxy URL (client-facing)
 }
 
 // QGISCreateProjectRequest is the request body sent to the QGIS project-creation plugin.
