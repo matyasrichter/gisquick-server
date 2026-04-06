@@ -45,7 +45,7 @@ func (q *QGISPluginClient) createProjectURL() (string, error) {
 //
 // Failure is treated as non-fatal by the caller — WMS/WFS simply won't be available
 // if this step fails.
-func (q *QGISPluginClient) CreateProject(ctx context.Context, jobDir string, artifacts []Artifact) (string, error) {
+func (q *QGISPluginClient) CreateProject(ctx context.Context, jobDir, serviceURL string, artifacts []Artifact) (string, error) {
 	endpoint, err := q.createProjectURL()
 	if err != nil {
 		return "", err
@@ -60,8 +60,9 @@ func (q *QGISPluginClient) CreateProject(ctx context.Context, jobDir string, art
 	}
 
 	reqBody := QGISCreateProjectRequest{
-		JobDir: jobDir,
-		Files:  files,
+		JobDir:     jobDir,
+		ServiceURL: serviceURL,
+		Files:      files,
 	}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {

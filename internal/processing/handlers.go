@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +14,7 @@ import (
 
 	"github.com/gisquick/gisquick-server/internal/application"
 	"github.com/gisquick/gisquick-server/internal/domain"
+	"github.com/gisquick/gisquick-server/internal/infrastructure/proxy"
 	"github.com/gofrs/uuid"
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
@@ -32,20 +31,9 @@ type Handlers struct {
 	mapserverURL string
 	jobs         JobStore
 	publishRoot  string
-	reverseProxy *httputil.ReverseProxy
 }
 
 func NewHandlers(projects application.ProjectService, log *zap.SugaredLogger, mapserverURL, publishRoot, pluginSecret string, jobs JobStore) *Handlers {
-	director := func(req *http.Request) {
-		target, _ := url.Parse(mapserverURL)
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.URL.Path = target.Path
-		if _, ok := req.Header["User-Agent"]; !ok {
-			req.Header.Set("User-Agent", "")
-		}
-		req.Header.Del("Cookie")
-	}
 	return &Handlers{
 		projects:     projects,
 		ogcClient:    NewOGCAPIClient(log),
@@ -54,7 +42,6 @@ func NewHandlers(projects application.ProjectService, log *zap.SugaredLogger, ma
 		mapserverURL: mapserverURL,
 		jobs:         jobs,
 		publishRoot:  publishRoot,
-		reverseProxy: &httputil.ReverseProxy{Director: director},
 	}
 }
 
@@ -635,16 +622,16 @@ func (h *Handlers) runJob(projectName, jobID, base string, remote domain.RemoteC
 	}
 
 	// 3. Ask the QGIS plugin to create a project file (non-fatal on error).
+	jobBase := base + "/jobs/" + jobID
 	var projectFile string
 	if len(artifacts) > 0 {
-		projectFile, err = h.qgisPlugin.CreateProject(ctx, relJobDir, artifacts)
+		projectFile, err = h.qgisPlugin.CreateProject(ctx, relJobDir, jobBase+"/ows", artifacts)
 		if err != nil {
 			h.log.Warnw("QGIS plugin create-project failed (WMS/WFS unavailable)", "jobID", jobID, zap.Error(err))
 		}
 	}
 
 	// 4. Remap artifact download URLs to our own endpoint.
-	jobBase := base + "/jobs/" + jobID
 	for i, a := range artifacts {
 		artifacts[i].DownloadURL = jobBase + "/artifacts/" + a.Path
 	}
@@ -663,8 +650,8 @@ func (h *Handlers) runJob(projectName, jobID, base string, remote domain.RemoteC
 	record.Artifacts = artifacts
 	record.FinishedAt = &now
 	if projectFile != "" {
-		record.WmsURL = jobBase + "/wms"
-		record.OgcApiFeaturesURL = jobBase + "/ogcapi-features"
+		record.WmsURL = jobBase + "/ows?SERVICE=WMS"
+		record.WfsURL = jobBase + "/ows?SERVICE=WFS"
 	}
 	if saveErr := h.jobs.Save(ctx, record); saveErr != nil {
 		h.log.Errorw("saving completed job record", "jobID", jobID, zap.Error(saveErr))
@@ -735,18 +722,18 @@ func (h *Handlers) HandleJobResults() echo.HandlerFunc {
 		}
 
 		type jobResults struct {
-			Artifacts         []Artifact `json:"artifacts"`
-			WmsURL            string     `json:"wms_url,omitempty"`
-			OgcApiFeaturesURL string     `json:"ogcapi_features_url,omitempty"`
+			Artifacts []Artifact `json:"artifacts"`
+			WmsURL    string     `json:"wms_url,omitempty"`
+			WfsURL    string     `json:"wfs_url,omitempty"`
 		}
 		artifacts := record.Artifacts
 		if artifacts == nil {
 			artifacts = []Artifact{}
 		}
 		return c.JSON(http.StatusOK, jobResults{
-			Artifacts:         artifacts,
-			WmsURL:            record.WmsURL,
-			OgcApiFeaturesURL: record.OgcApiFeaturesURL,
+			Artifacts: artifacts,
+			WmsURL:    record.WmsURL,
+			WfsURL:    record.WfsURL,
 		})
 	}
 }
@@ -770,44 +757,43 @@ func (h *Handlers) HandleArtifactDownload() echo.HandlerFunc {
 	}
 }
 
-// HandleWMSProxy proxies WMS requests for a job result to QGIS Server using the MAP parameter.
-func (h *Handlers) HandleWMSProxy() echo.HandlerFunc {
-	return func(c echo.Context) error {
-		return h.proxyJobGeoService(c, c.Param("jobId"))
-	}
-}
-
-// HandleOgcApiFeaturesProxy proxies OGC API Features requests for a job result.
-// Currently uses the same QGIS project as WMS; the specific service is determined by
-// QGIS Server based on the request parameters.
-func (h *Handlers) HandleOgcApiFeaturesProxy() echo.HandlerFunc {
-	return func(c echo.Context) error {
-		return h.proxyJobGeoService(c, c.Param("jobId"))
-	}
+// HandleOWSProxy proxies OWS (WMS/WFS) requests for a job result to QGIS Server.
+// The SERVICE query parameter in the request determines which service is used.
+func (h *Handlers) HandleOWSProxy() echo.HandlerFunc {
+	return h.proxyJobGeoService()
 }
 
 // proxyJobGeoService sets the MAP parameter to the job's QGIS project file and
-// forwards the request to QGIS Server, identical to handleProjectOws.
-func (h *Handlers) proxyJobGeoService(c echo.Context, jobID string) error {
-	if strings.Contains(jobID, "..") {
-		return echo.NewHTTPError(http.StatusBadRequest, "Invalid job ID")
+// forwards the request to QGIS Server, following the same pattern as handleProjectOws.
+func (h *Handlers) proxyJobGeoService() echo.HandlerFunc {
+	reverseProxy := proxy.NewQGISReverseProxy(h.mapserverURL, h.log)
+	capabilitiesProxy := proxy.NewQGISReverseProxy(h.mapserverURL, h.log)
+	capabilitiesProxy.ModifyResponse = proxy.RewriteCapabilitiesURLs
+	return func(c echo.Context) error {
+		jobID := c.Param("jobId")
+		if strings.Contains(jobID, "..") {
+			return echo.NewHTTPError(http.StatusBadRequest, "Invalid job ID")
+		}
+		record, err := h.lookupJob(c, jobID)
+		if err != nil {
+			return err
+		}
+		if record.ProjectFile == "" {
+			return echo.NewHTTPError(http.StatusNotFound, "Geo service not available for this job")
+		}
+		mapPath := filepath.Join(h.publishRoot, "__jobs", jobID, record.ProjectFile)
+		req := c.Request()
+		query := req.URL.Query()
+		query.Set("MAP", mapPath)
+		req.URL.RawQuery = query.Encode()
+		if strings.EqualFold(query.Get("SERVICE"), "WMS") && strings.EqualFold(query.Get("REQUEST"), "GetCapabilities") {
+			req.Header.Set("X-Ows-Url", req.URL.Path)
+			capabilitiesProxy.ServeHTTP(c.Response(), req)
+		} else {
+			reverseProxy.ServeHTTP(c.Response(), req)
+		}
+		return nil
 	}
-
-	record, err := h.lookupJob(c, jobID)
-	if err != nil {
-		return err
-	}
-	if record.ProjectFile == "" {
-		return echo.NewHTTPError(http.StatusNotFound, "Geo service not available for this job")
-	}
-
-	mapPath := filepath.Join(h.publishRoot, "__jobs", jobID, record.ProjectFile)
-	query := c.Request().URL.Query()
-	query.Set("MAP", mapPath)
-	c.Request().URL.RawQuery = query.Encode()
-
-	h.reverseProxy.ServeHTTP(c.Response(), c.Request())
-	return nil
 }
 
 // lookupJob retrieves a JobRecord from Redis, verifying the project scope matches the URL.

@@ -107,14 +107,15 @@ type JobRecord struct {
 	CreatedAt    time.Time  `json:"created_at"`
 	FinishedAt   *time.Time `json:"finished_at,omitempty"` // Set when background goroutine completes
 	Artifacts    []Artifact `json:"artifacts"`             // Artifacts with client-facing download URLs
-	WmsURL       string     `json:"wms_url,omitempty"`     // Our WMS proxy URL (client-facing)
-	OgcApiFeaturesURL string `json:"ogcapi_features_url,omitempty"` // Our OGC API Features proxy URL (client-facing)
+	WmsURL string `json:"wms_url,omitempty"` // Our WMS proxy URL (client-facing)
+	WfsURL string `json:"wfs_url,omitempty"` // Our WFS proxy URL (client-facing)
 }
 
 // QGISCreateProjectRequest is the request body sent to the QGIS project-creation plugin.
 type QGISCreateProjectRequest struct {
-	JobDir string                  `json:"job_dir"`
-	Files  []QGISCreateProjectFile `json:"files"`
+	JobDir     string                  `json:"job_dir"`
+	ServiceURL string                  `json:"service_url,omitempty"`
+	Files      []QGISCreateProjectFile `json:"files"`
 }
 
 // QGISCreateProjectFile describes one artifact file for the QGIS plugin.

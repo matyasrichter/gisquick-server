@@ -5,17 +5,16 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"html"
 	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/gisquick/gisquick-server/internal/domain"
+	"github.com/gisquick/gisquick-server/internal/infrastructure/proxy"
 	"github.com/labstack/echo/v4"
 )
 
@@ -140,47 +139,9 @@ func (s *Server) handleMapOws() func(c echo.Context) error {
 		}
 		req.Header.Del("Cookie")
 	}
-	rewriteGetCapabilities := func(resp *http.Response) (err error) {
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-		err = resp.Body.Close()
-		if err != nil {
-			return err
-		}
-		// original url is still in xsi:schemaLocation
-		// regexp.MustCompile(`xsi:schemaLocation="(.)+"`)
-
-		// reg := regexp.MustCompile(`xlink:href="http://localhost[^"]+"`)
-		reg := regexp.MustCompile(`xlink:href="http[s]?://[^"]+MAP=[^"]+"`)
-
-		owsPath := resp.Request.Header.Get("X-Ows-Url")
-		doc := string(body)
-		replaced := make(map[string]string, 2)
-		for _, match := range reg.FindAllString(doc, -1) {
-			_, done := replaced[match]
-			if !done {
-				u := strings.TrimPrefix(match, `xlink:href="`)
-				u = strings.TrimSuffix(u, `"`)
-				parsed, _ := url.Parse(html.UnescapeString(u))
-				params := parsed.Query()
-				params.Del("MAP")
-				parsed.Path = owsPath
-				parsed.RawQuery = params.Encode()
-				replaced[match] = fmt.Sprintf(`xlink:href="%s"`, html.EscapeString(parsed.String()))
-				doc = strings.ReplaceAll(doc, match, replaced[match])
-			}
-		}
-		newBody := []byte(doc)
-		resp.Body = ioutil.NopCloser(bytes.NewReader(newBody))
-		resp.ContentLength = int64(len(newBody))
-		resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
-		return nil
-	}
 	reverseProxy := &httputil.ReverseProxy{Director: director}
 	capabilitiesProxy := &httputil.ReverseProxy{Director: director}
-	capabilitiesProxy.ModifyResponse = rewriteGetCapabilities
+	capabilitiesProxy.ModifyResponse = proxy.RewriteCapabilitiesURLs
 
 	return func(c echo.Context) error {
 		params := new(OwsRequestParams)

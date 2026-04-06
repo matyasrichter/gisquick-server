@@ -159,8 +159,7 @@ func (s *Server) AddRoutes(e *echo.Echo) {
 	e.GET("/api/map/ogc-processes/:user/:name/jobs/:jobId", procHandlers.HandleJobStatus(), ProjectAccess)
 	e.GET("/api/map/ogc-processes/:user/:name/jobs/:jobId/results", procHandlers.HandleJobResults(), ProjectAccess)
 	e.GET("/api/map/ogc-processes/:user/:name/jobs/:jobId/artifacts/:filename", procHandlers.HandleArtifactDownload(), ProjectAccess)
-	e.Any("/api/map/ogc-processes/:user/:name/jobs/:jobId/wms", procHandlers.HandleWMSProxy(), ProjectAccess)
-	e.Any("/api/map/ogc-processes/:user/:name/jobs/:jobId/ogcapi-features", procHandlers.HandleOgcApiFeaturesProxy(), ProjectAccess)
+	e.Any("/api/map/ogc-processes/:user/:name/jobs/:jobId/ows", procHandlers.HandleOWSProxy(), ProjectAccess)
 
 	// owsHandler := s.owsHandler()
 	// e.GET("/api/map/ows", owsHandler)

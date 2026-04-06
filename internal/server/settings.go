@@ -12,7 +12,6 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,6 +21,7 @@ import (
 	"github.com/disintegration/imaging"
 	"github.com/gisquick/gisquick-server/internal/application"
 	"github.com/gisquick/gisquick-server/internal/domain"
+	"github.com/gisquick/gisquick-server/internal/infrastructure/proxy"
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
 	_ "golang.org/x/image/webp"
@@ -329,41 +329,8 @@ func (s *Server) handleDeleteProjectFiles() func(echo.Context) error {
 }
 
 func (s *Server) handleProjectOws() func(echo.Context) error {
-	type RequestParams struct {
-		Map string `query:"map"`
-	}
-	director := func(req *http.Request) {
-		target, _ := url.Parse(s.Config.MapserverURL)
-		// query := req.URL.Query()
-		// project := req.URL.Query().Get("MAP")
-		// req.URL.RawQuery = query.Encode()
-		s.log.Infow("Map proxy", "query", req.URL.RawQuery)
-		req.URL.Path = target.Path
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-
-		if _, ok := req.Header["User-Agent"]; !ok {
-			// explicitly disable User-Agent so it's not set to default value
-			req.Header.Set("User-Agent", "")
-		}
-	}
-	reverseProxy := &httputil.ReverseProxy{Director: director}
-	reverseProxy.ErrorHandler = func(rw http.ResponseWriter, r *http.Request, e error) {
-		s.log.Errorw("mapserver proxy error", zap.Error(e))
-	}
-	// reverseProxy.ErrorLog.SetOutput(os.Stdout)
+	reverseProxy := proxy.NewQGISReverseProxy(s.Config.MapserverURL, s.log)
 	return func(c echo.Context) error {
-		// params := new(RequestParams)
-		// if err := (&echo.DefaultBinder{}).BindQueryParams(c, params); err != nil {
-		// 	return echo.NewHTTPError(http.StatusBadRequest, "Invalid query parameters")
-		// }
-
-		// project := params.Map
-		// user, err := s.auth.GetUser(c)
-		// if err != nil {
-		// 	return err
-		// }
-		// c.Request().URL.Query()
 		projectName := c.Get("project").(string)
 
 		p, err := s.projects.GetProjectInfo(projectName)
