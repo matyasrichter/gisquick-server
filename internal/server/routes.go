@@ -144,7 +144,7 @@ func (s *Server) AddRoutes(e *echo.Echo) {
 	}
 
 	// Processing module
-	procHandlers := processing.NewHandlers(s.projects, s.log, s.Config.MapserverURL, s.Config.ProcessingProxySecret, s.jobStore)
+	procHandlers := processing.NewHandlers(s.projects, s.log, s.Config.MapserverURL, s.Config.PublishRoot, s.Config.QGISPluginSecret, s.jobStore)
 	e.POST("/api/project/processing/:user/:name", procHandlers.HandleAddProcessingService(), ProjectAdminAccess)
 	e.PUT("/api/project/processing/:user/:name/:id", procHandlers.HandleUpdateProcessingService(), ProjectAdminAccess)
 	e.DELETE("/api/project/processing/:user/:name/:id", procHandlers.HandleDeleteProcessingService(), ProjectAdminAccess)

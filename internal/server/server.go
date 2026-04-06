@@ -35,8 +35,9 @@ type Config struct {
 	SignupAPI            bool
 	PluginsURL           string
 	MaxProjectSize        int64
-	ProjectCustomization  bool
-	ProcessingProxySecret string
+	ProjectCustomization bool
+	PublishRoot          string
+	QGISPluginSecret     string
 }
 
 var extensions = make(map[string]func(s *Server) error, 0)

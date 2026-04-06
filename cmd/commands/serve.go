@@ -119,8 +119,8 @@ func Serve() error {
 			ActivationSubject    string `conf:"default:Gisquick Registration"`
 			PasswordResetSubject string `conf:"default:Gisquick Password Reset"`
 		}
-		ProcessingProxy struct {
-			SharedSecret string `conf:"env:PROCESSING_PROXY_SHARED_SECRET,mask"`
+		Processing struct {
+			Secret string `conf:"mask"`
 		}
 	}{}
 
@@ -214,8 +214,9 @@ func Serve() error {
 		SignupAPI:            cfg.Gisquick.SignupAPI,
 		SiteURL:              cfg.Web.SiteURL,
 		MaxProjectSize:       int64(cfg.Gisquick.ProjectSizeLimit),
-		ProjectCustomization:  cfg.Gisquick.ProjectCustomization,
-		ProcessingProxySecret: cfg.ProcessingProxy.SharedSecret,
+		ProjectCustomization: cfg.Gisquick.ProjectCustomization,
+		PublishRoot:          cfg.Gisquick.ProjectsRoot,
+		QGISPluginSecret:     cfg.Processing.Secret,
 	}
 
 	// Services

@@ -15,37 +15,24 @@ import (
 	"go.uber.org/zap"
 )
 
-// mockProxy is a test double for ProcessProxy.
-type mockProxy struct {
-	forwardFunc func(method, url string, body io.Reader, headers http.Header) (*http.Response, error)
-}
-
-func (m *mockProxy) ForwardRequest(method, url string, body io.Reader, headers http.Header) (*http.Response, error) {
-	return m.forwardFunc(method, url, body, headers)
-}
-
-func (m *mockProxy) ExecuteViaProxy(_ context.Context, _ string, _ *ProxyExecuteRequest) (*ProxyExecuteResponse, error) {
-	return nil, nil
-}
-
-// mockJobStore is an in-memory JobStore for use in tests.
-type mockJobStore struct {
+// inMemJobStore implements JobStore in memory for tests.
+type inMemJobStore struct {
 	records map[string]*JobRecord
 }
 
-func (m *mockJobStore) Save(_ context.Context, r *JobRecord) error {
-	if m.records == nil {
-		m.records = make(map[string]*JobRecord)
+func (s *inMemJobStore) Save(_ context.Context, r *JobRecord) error {
+	if s.records == nil {
+		s.records = make(map[string]*JobRecord)
 	}
-	m.records[r.Project+":"+r.JobID] = r
+	s.records[r.Project+":"+r.JobID] = r
 	return nil
 }
 
-func (m *mockJobStore) Get(_ context.Context, project, jobID string) (*JobRecord, error) {
-	if m.records == nil {
+func (s *inMemJobStore) Get(_ context.Context, project, jobID string) (*JobRecord, error) {
+	if s.records == nil {
 		return nil, ErrJobNotFound
 	}
-	r, ok := m.records[project+":"+jobID]
+	r, ok := s.records[project+":"+jobID]
 	if !ok {
 		return nil, ErrJobNotFound
 	}
@@ -53,13 +40,20 @@ func (m *mockJobStore) Get(_ context.Context, project, jobID string) (*JobRecord
 }
 
 // newTestHandlers creates a Handlers instance suitable for unit tests.
-func newTestHandlers(projects *mock.ProjectService, proxy ProcessProxy) *Handlers {
-	return &Handlers{
-		projects: projects,
-		proxy:    proxy,
-		log:      zap.NewNop().Sugar(),
-		jobs:     &mockJobStore{},
+// Pass an optional *http.Client to override the OGC client's HTTP client (e.g. for fake servers).
+func newTestHandlers(projects *mock.ProjectService, httpClient *http.Client) *Handlers {
+	log := zap.NewNop().Sugar()
+	h := &Handlers{
+		projects:   projects,
+		ogcClient:  NewOGCAPIClient(log),
+		qgisPlugin: NewQGISPluginClient("http://unused", ""),
+		log:        log,
+		jobs:       &inMemJobStore{},
 	}
+	if httpClient != nil {
+		h.ogcClient.httpClient = httpClient
+	}
+	return h
 }
 
 // newEchoCtx returns an Echo context backed by a response recorder.
@@ -88,19 +82,16 @@ func TestPrefixProcessID(t *testing.T) {
 }
 
 func TestParsePrefixedID(t *testing.T) {
-	// round-trip with UUID-style prefix
 	svcID, id, err := ParsePrefixedID("abc:clip")
 	if err != nil || svcID != "abc" || id != "clip" {
 		t.Errorf("round-trip failed: svcID=%q id=%q err=%v", svcID, id, err)
 	}
 
-	// error: no colon
 	_, _, err = ParsePrefixedID("nocolon")
 	if err == nil {
 		t.Error("expected error for missing colon")
 	}
 }
-
 
 func TestServiceRequestValidate(t *testing.T) {
 	cases := []struct {
@@ -166,8 +157,7 @@ func TestHandleAddProcessingServiceWPS(t *testing.T) {
 		},
 	}
 
-	// WPS type: proxy.FetchProcessList must NOT be called
-	h := newTestHandlers(projects, nil) // nil proxy is safe for WPS
+	h := newTestHandlers(projects, nil)
 	body := `{"url":"http://wps.example.com","type":"wps","name":"My WPS"}`
 	c, rec := newEchoCtx(http.MethodPost, "/", body)
 
@@ -190,6 +180,21 @@ func TestHandleAddProcessingServiceWPS(t *testing.T) {
 }
 
 func TestHandleAddProcessingServiceOGC(t *testing.T) {
+	// Fake OGC API backend.
+	fakeOGC := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/processes") && !strings.Contains(r.URL.Path, "/processes/"):
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"processes":[{"id":"buffer","title":"Buffer"}],"links":[]}`)
+		case strings.HasSuffix(r.URL.Path, "/processes/buffer"):
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"buffer","title":"Buffer","description":"Computes a buffer."}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer fakeOGC.Close()
+
 	var saved domain.ProcessingConfig
 	projects := &mock.ProjectService{
 		GetProcessingConfigFunc: func(n string) (domain.ProcessingConfig, error) {
@@ -201,28 +206,8 @@ func TestHandleAddProcessingServiceOGC(t *testing.T) {
 		},
 	}
 
-	proxy := &mockProxy{
-		forwardFunc: func(method, url string, body io.Reader, headers http.Header) (*http.Response, error) {
-			if strings.HasSuffix(url, "/processes") && !strings.Contains(url, "/processes/") {
-				listBody := `{"processes":[{"id":"buffer","title":"Buffer"}],"links":[]}`
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(listBody)),
-				}, nil
-			}
-			if strings.HasSuffix(url, "/processes/buffer") {
-				descBody := `{"id":"buffer","title":"Buffer","description":"Computes a buffer around geometries."}`
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader(descBody)),
-				}, nil
-			}
-			return nil, nil
-		},
-	}
-
-	h := newTestHandlers(projects, proxy)
-	reqBody := `{"url":"http://ogc.example.com","type":"ogcapi-processes","name":"OGC"}`
+	h := newTestHandlers(projects, fakeOGC.Client())
+	reqBody := `{"url":"` + fakeOGC.URL + `","type":"ogcapi-processes","name":"OGC"}`
 	c, rec := newEchoCtx(http.MethodPost, "/", reqBody)
 
 	if err := h.HandleAddProcessingService()(c); err != nil {
@@ -238,7 +223,7 @@ func TestHandleAddProcessingServiceOGC(t *testing.T) {
 	if svc.ID == "" {
 		t.Error("expected non-empty service ID")
 	}
-	if svc.URL != "http://ogc.example.com" || svc.Type != domain.ProcessingServiceTypeOGCProcesses {
+	if svc.URL != fakeOGC.URL || svc.Type != domain.ProcessingServiceTypeOGCProcesses {
 		t.Errorf("unexpected saved service: %+v", svc)
 	}
 	procCfg, ok := svc.Processes["buffer"]

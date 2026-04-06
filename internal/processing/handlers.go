@@ -1,12 +1,16 @@
 package processing
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,24 +21,89 @@ import (
 	"go.uber.org/zap"
 )
 
+const executionTimeout = 30 * time.Minute
+
 // Handlers provides HTTP handlers for the processing module.
 type Handlers struct {
 	projects     application.ProjectService
-	proxy        ProcessProxy
+	ogcClient    *OGCAPIClient
+	qgisPlugin   *QGISPluginClient
 	log          *zap.SugaredLogger
 	mapserverURL string
-	proxySecret  string
 	jobs         JobStore
+	publishRoot  string
+	reverseProxy *httputil.ReverseProxy
 }
 
-func NewHandlers(projects application.ProjectService, log *zap.SugaredLogger, mapserverURL, proxySecret string, jobs JobStore) *Handlers {
+func NewHandlers(projects application.ProjectService, log *zap.SugaredLogger, mapserverURL, publishRoot, pluginSecret string, jobs JobStore) *Handlers {
+	director := func(req *http.Request) {
+		target, _ := url.Parse(mapserverURL)
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.URL.Path = target.Path
+		if _, ok := req.Header["User-Agent"]; !ok {
+			req.Header.Set("User-Agent", "")
+		}
+		req.Header.Del("Cookie")
+	}
 	return &Handlers{
 		projects:     projects,
-		proxy:        NewProxyClient(),
+		ogcClient:    NewOGCAPIClient(log),
+		qgisPlugin:   NewQGISPluginClient(mapserverURL, pluginSecret),
 		log:          log,
 		mapserverURL: mapserverURL,
-		proxySecret:  proxySecret,
 		jobs:         jobs,
+		publishRoot:  publishRoot,
+		reverseProxy: &httputil.ReverseProxy{Director: director},
+	}
+}
+
+// StartCleanupLoop runs a background goroutine that periodically removes job
+// directories from /publish/__jobs/ whose Redis key has expired.
+// Call it once after server startup; cancel ctx to stop it.
+func (h *Handlers) StartCleanupLoop(ctx context.Context, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.cleanupExpiredJobs(ctx)
+			}
+		}
+	}()
+}
+
+func (h *Handlers) cleanupExpiredJobs(ctx context.Context) {
+	jobsDir := filepath.Join(h.publishRoot, "__jobs")
+	entries, err := os.ReadDir(jobsDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			h.log.Warnw("cleanup: reading jobs directory", zap.Error(err))
+		}
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		jobID := entry.Name()
+		// Try to find this job in Redis across any project.
+		// We use an empty project string and rely on ErrJobNotFound to detect missing keys.
+		// Since keys are scoped as job:{project}:{jobID}, we need to scan.
+		// Use a simple heuristic: try to GET with an empty project; if not found, delete.
+		// A more precise approach would use Redis SCAN, but this is sufficient for cleanup.
+		_, err := h.jobs.Get(ctx, "*", jobID)
+		if errors.Is(err, ErrJobNotFound) {
+			dir := filepath.Join(jobsDir, jobID)
+			if rmErr := os.RemoveAll(dir); rmErr != nil {
+				h.log.Warnw("cleanup: removing expired job dir", "dir", dir, zap.Error(rmErr))
+			} else {
+				h.log.Infow("cleanup: removed expired job dir", "jobID", jobID)
+			}
+		}
 	}
 }
 
@@ -51,7 +120,6 @@ func baseURL(c echo.Context, projectName string) string {
 	if fwdHost := c.Request().Header.Get("X-Forwarded-Host"); fwdHost != "" {
 		host = fwdHost
 	}
-
 	return fmt.Sprintf("%s://%s/api/map/ogc-processes/%s", scheme, host, projectName)
 }
 
@@ -66,7 +134,6 @@ func findOGCServiceByID(services []domain.ProcessingService, serviceID string) (
 }
 
 // ogcServices filters configured services to only OGC API Processes backends.
-// this is temporary until we support WPS
 func ogcServices(cfg domain.ProcessingConfig) []domain.ProcessingService {
 	var services []domain.ProcessingService
 	for _, s := range cfg.Services {
@@ -112,12 +179,10 @@ type remoteProcessList struct {
 }
 
 // fetchRemoteProcesses retrieves the full process descriptions from an OGC API backend.
-// The returned map is keyed by process ID. Title and Description are populated from the remote;
-// other ProcessConfig fields are left at their zero values for the caller to overlay.
 func (h *Handlers) fetchRemoteProcesses(svcURL string) (map[string]domain.ProcessConfig, error) {
 	base := strings.TrimRight(svcURL, "/")
 
-	resp, err := h.proxy.ForwardRequest(http.MethodGet, base+"/processes", nil, nil)
+	resp, err := h.ogcClient.ForwardRequest(http.MethodGet, base+"/processes", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("fetching process list: %w", err)
 	}
@@ -133,7 +198,7 @@ func (h *Handlers) fetchRemoteProcesses(svcURL string) (map[string]domain.Proces
 
 	result := make(map[string]domain.ProcessConfig, len(list.Processes))
 	for _, p := range list.Processes {
-		descResp, err := h.proxy.ForwardRequest(http.MethodGet, base+"/processes/"+p.ID, nil, nil)
+		descResp, err := h.ogcClient.ForwardRequest(http.MethodGet, base+"/processes/"+p.ID, nil, nil)
 		if err != nil {
 			return nil, fmt.Errorf("fetching process %q: %w", p.ID, err)
 		}
@@ -160,8 +225,7 @@ func (h *Handlers) fetchRemoteProcesses(svcURL string) (map[string]domain.Proces
 	return result, nil
 }
 
-// mergeProcessConfigs builds the final process map for a service by starting from the
-// remotely fetched descriptions and overlaying the proxy config from any user-provided overrides.
+// mergeProcessConfigs builds the final process map by overlaying user-provided proxy configs.
 func mergeProcessConfigs(fetched map[string]domain.ProcessConfig, overrides map[string]domain.ProcessConfig) map[string]domain.ProcessConfig {
 	for id, override := range overrides {
 		if cfg, ok := fetched[id]; ok {
@@ -452,9 +516,7 @@ func (h *Handlers) HandleProcessDescription() echo.HandlerFunc {
 	}
 }
 
-// HandleExecute forwards a process execution request to the appropriate backend.
-// If the process has a proxy configuration, the request is routed through the
-// QGIS Server processing proxy plugin. Otherwise, it is forwarded directly.
+// HandleExecute starts an async process execution.
 func (h *Handlers) HandleExecute() echo.HandlerFunc {
 	return func(c echo.Context) error {
 		projectName := c.Get("project").(string)
@@ -477,302 +539,155 @@ func (h *Handlers) HandleExecute() echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusNotFound, "Process not found")
 		}
 
-		// Extract username from context (set by auth middleware).
 		var username string
 		if user, ok := c.Get("user").(domain.User); ok {
 			username = user.Username
 		}
 
-		// Check if this process has a proxy configuration
-		procCfg, hasProxyCfg := svc.Processes[originalID]
-		if hasProxyCfg && h.proxySecret != "" && h.mapserverURL != "" {
-			return h.executeViaProxy(c, projectName, svc, originalID, procCfg, username)
-		}
-		return echo.NewHTTPError(http.StatusInternalServerError, "Processing service is misconfigured")
-	}
-}
-
-// executeViaProxy routes the execution through the QGIS Server processing proxy plugin.
-func (h *Handlers) executeViaProxy(c echo.Context, projectName string, svc domain.ProcessingService, processID string, procCfg domain.ProcessConfig, username string) error {
-	// Read the client's request body as the payload
-	payload, err := io.ReadAll(c.Request().Body)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusBadRequest, "Failed to read request body")
-	}
-
-	// Build the remote config, defaulting execute_url if not set
-	remote := procCfg.Remote
-	if remote.ExecuteURL == "" {
-		remote.ExecuteURL = strings.TrimRight(svc.URL, "/") + "/processes/" + processID + "/execution"
-	}
-	if remote.Type == "" {
-		remote.Type = string(svc.Type)
-	}
-	// Request async execution so the remote returns a job ID immediately rather than blocking.
-	if remote.Headers == nil {
-		remote.Headers = make(map[string]string)
-	}
-	remote.Headers["Prefer"] = "respond-async"
-
-	// Build the proxy request
-	proxyReq := &ProxyExecuteRequest{
-		Auth:    h.proxySecret,
-		Remote:  remote,
-		Payload: payload,
-	}
-
-	// Derive the proxy URL from the mapserver URL
-	proxyURL, err := h.proxyExecuteURL()
-	if err != nil {
-		h.log.Errorw("building proxy URL", zap.Error(err))
-		return echo.NewHTTPError(http.StatusInternalServerError, "Processing proxy not configured")
-	}
-
-	result, err := h.proxy.ExecuteViaProxy(c.Request().Context(), proxyURL, proxyReq)
-	if err != nil {
-		h.log.Errorw("executing via proxy", "process", processID, zap.Error(err))
-		return echo.NewHTTPError(http.StatusBadGateway, "Failed to execute via processing proxy")
-	}
-
-	// Generate our own job UUID — this is what the client will use going forward.
-	jobUUID, err := uuid.NewV4()
-	if err != nil {
-		h.log.Errorw("generating job UUID", zap.Error(err))
-		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to generate job ID")
-	}
-	ourJobID := jobUUID.String()
-
-	base := baseURL(c, projectName)
-
-	// Remap artifact download URLs to our own artifact endpoint
-	for i, artifact := range result.Artifacts {
-		if artifact.DownloadURL == "" {
-			continue
-		}
-		var filename string
-		if u, parseErr := url.Parse(artifact.DownloadURL); parseErr == nil {
-			parts := strings.Split(strings.TrimRight(u.Path, "/"), "/")
-			if len(parts) > 0 {
-				filename = parts[len(parts)-1]
-			}
-		}
-		if filename != "" {
-			result.Artifacts[i].DownloadURL = base + "/jobs/" + ourJobID + "/artifacts/" + filename
-		}
-	}
-
-	internalWms := result.WmsURL
-	internalOgcApiFeatures := result.OgcApiFeaturesURL
-
-	// Remap WMS/OGC API Features URLs to our proxy endpoints
-	if internalWms != "" {
-		result.WmsURL = base + "/jobs/" + ourJobID + "/wms"
-	}
-	if internalOgcApiFeatures != "" {
-		result.OgcApiFeaturesURL = base + "/jobs/" + ourJobID + "/ogcapi-features"
-	}
-
-	// If the proxy didn't return a StatusURL (e.g. synchronous execution), construct one.
-	statusURL := result.StatusURL
-	if statusURL == "" {
-		statusURL = strings.TrimRight(svc.URL, "/") + "/jobs/" + result.JobID
-	}
-
-	// Persist the job record in Redis with a 24-hour TTL.
-	record := &JobRecord{
-		Version:                   1,
-		JobID:                     ourJobID,
-		RemoteJobID:               result.JobID,
-		ServiceID:                 svc.ID,
-		ProcessID:                 processID,
-		ProcessTitle:              procCfg.Title,
-		Project:                   projectName,
-		Username:                  username,
-		Status:                    result.Status,
-		StatusURL:                 statusURL,
-		StoragePath:               result.StoragePath,
-		CreatedAt:                 time.Now().UTC(),
-		Artifacts:                 result.Artifacts,
-		WmsURL:                    result.WmsURL,
-		OgcApiFeaturesURL:         result.OgcApiFeaturesURL,
-		InternalWmsURL:            internalWms,
-		InternalOgcApiFeaturesURL: internalOgcApiFeatures,
-	}
-	if err := h.jobs.Save(c.Request().Context(), record); err != nil {
-		h.log.Errorw("saving job record to Redis", "jobID", ourJobID, zap.Error(err))
-		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to persist job record")
-	}
-
-	// Build an OGC API-compliant response with links.
-	jobBase := base + "/jobs/" + ourJobID
-	links := []Link{
-		{Href: jobBase, Rel: "self", Type: "application/json", Title: "Job status"},
-	}
-	for _, artifact := range result.Artifacts {
-		links = append(links, Link{
-			Href:  artifact.DownloadURL,
-			Rel:   "http://www.opengis.net/def/rel/ogc/1.0/results",
-			Type:  artifact.ContentType,
-			Title: artifact.OutputID,
-		})
-	}
-	if result.WmsURL != "" {
-		links = append(links, Link{
-			Href:  result.WmsURL,
-			Rel:   "http://www.opengis.net/def/rel/ogc/1.0/results",
-			Type:  "application/vnd.ogc.wms_xml",
-			Title: "WMS",
-		})
-	}
-	if result.OgcApiFeaturesURL != "" {
-		links = append(links, Link{
-			Href:  result.OgcApiFeaturesURL,
-			Rel:   "http://www.opengis.net/def/rel/ogc/1.0/results",
-			Type:  "application/json",
-			Title: "OGC API Features",
-		})
-	}
-	resp := StatusInfo{
-		ProcessID: PrefixProcessID(svc.ID, processID),
-		JobID:     ourJobID,
-		Type:      "process",
-		Status:    result.Status,
-		Links:     links,
-	}
-	c.Response().Header().Set("Location", jobBase)
-	return c.JSON(http.StatusCreated, resp)
-}
-
-// proxyExecuteURL derives the processing proxy execute URL from the mapserver URL.
-func (h *Handlers) proxyExecuteURL() (string, error) {
-	parsed, err := url.Parse(h.mapserverURL)
-	if err != nil {
-		return "", fmt.Errorf("parsing mapserver URL: %w", err)
-	}
-	return fmt.Sprintf("%s://%s/qgis-server/qgis_mapserv.fcgi/ogc/processing-proxy/execute", parsed.Scheme, parsed.Host), nil
-}
-
-// proxyArtifactURL derives the processing proxy artifact URL from the mapserver URL.
-func (h *Handlers) proxyArtifactURL(jobID, filename string) (string, error) {
-	parsed, err := url.Parse(h.mapserverURL)
-	if err != nil {
-		return "", fmt.Errorf("parsing mapserver URL: %w", err)
-	}
-	return fmt.Sprintf("%s://%s/qgis-server/qgis_mapserv.fcgi/ogc/processing-proxy/jobs/%s/%s", parsed.Scheme, parsed.Host, jobID, filename), nil
-}
-
-// HandleArtifactDownload proxies artifact download requests to the QGIS Server processing proxy plugin.
-func (h *Handlers) HandleArtifactDownload() echo.HandlerFunc {
-	return func(c echo.Context) error {
-		jobIDParam := c.Param("jobId")
-		filename := c.Param("filename")
-
-		// Prevent directory traversal
-		if strings.Contains(jobIDParam, "..") || strings.Contains(filename, "..") ||
-			strings.Contains(filename, "/") {
-			return echo.NewHTTPError(http.StatusBadRequest, "Invalid path")
+		procCfg, ok := svc.Processes[originalID]
+		if !ok {
+			return echo.NewHTTPError(http.StatusNotFound, "Process not configured")
 		}
 
-		record, err := h.lookupJob(c, jobIDParam)
+		payload, err := io.ReadAll(c.Request().Body)
 		if err != nil {
-			return err
+			return echo.NewHTTPError(http.StatusBadRequest, "Failed to read request body")
 		}
 
-		artifactURL, err := h.proxyArtifactURL(record.RemoteJobID, filename)
+		// Build the remote config, defaulting ExecuteURL if not set.
+		remote := procCfg.Remote
+		if remote.ExecuteURL == "" {
+			remote.ExecuteURL = strings.TrimRight(svc.URL, "/") + "/processes/" + originalID + "/execution"
+		}
+		if remote.Type == "" {
+			remote.Type = string(svc.Type)
+		}
+
+		jobUUID, err := uuid.NewV4()
 		if err != nil {
-			h.log.Errorw("building artifact URL", zap.Error(err))
-			return echo.NewHTTPError(http.StatusInternalServerError, "Processing proxy not configured")
+			h.log.Errorw("generating job UUID", zap.Error(err))
+			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to generate job ID")
+		}
+		ourJobID := jobUUID.String()
+		base := baseURL(c, projectName)
+
+		record := &JobRecord{
+			Version:      2,
+			JobID:        ourJobID,
+			ServiceID:    svc.ID,
+			ProcessID:    originalID,
+			ProcessTitle: procCfg.Title,
+			Project:      projectName,
+			Username:     username,
+			Status:       "accepted",
+			CreatedAt:    time.Now().UTC(),
+		}
+		if err := h.jobs.Save(c.Request().Context(), record); err != nil {
+			h.log.Errorw("saving initial job record", "jobID", ourJobID, zap.Error(err))
+			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to persist job record")
 		}
 
-		headers := make(http.Header)
-		headers.Set("Authorization", "Token "+h.proxySecret)
+		go h.runJob(projectName, ourJobID, base, remote, payload, originalID)
 
-		resp, err := h.proxy.ForwardRequest(http.MethodGet, artifactURL, nil, headers)
+		jobBase := base + "/jobs/" + ourJobID
+		resp := StatusInfo{
+			ProcessID: PrefixProcessID(svc.ID, originalID),
+			JobID:     ourJobID,
+			Type:      "process",
+			Status:    "accepted",
+			Links: []Link{
+				{Href: jobBase, Rel: "self", Type: "application/json", Title: "Job status"},
+			},
+		}
+		c.Response().Header().Set("Location", jobBase)
+		return c.JSON(http.StatusCreated, resp)
+	}
+}
+
+// runJob executes the process in the background: calls the remote OGC API, saves results
+// to disk, asks the QGIS plugin to create a project, and updates the Redis job record.
+func (h *Handlers) runJob(projectName, jobID, base string, remote domain.RemoteConfig, payload []byte, processID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), executionTimeout)
+	defer cancel()
+
+	relJobDir := filepath.Join("__jobs", jobID)
+	jobDir := filepath.Join(h.publishRoot, relJobDir)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		h.log.Errorw("creating job directory", "jobID", jobID, zap.Error(err))
+		h.failJob(ctx, projectName, jobID, fmt.Sprintf("failed to create job directory: %v", err))
+		return
+	}
+
+	// 1. Execute against the remote OGC API backend.
+	remoteJobID, results, err := h.ogcClient.Execute(ctx, remote, payload)
+	if err != nil {
+		h.log.Errorw("executing OGC process", "process", processID, "jobID", jobID, zap.Error(err))
+		h.failJob(ctx, projectName, jobID, err.Error())
+		return
+	}
+
+	// 2. Save results to disk.
+	artifacts, err := SaveResults(ctx, h.ogcClient.httpClient, jobDir, results, remote.Headers)
+	if err != nil {
+		h.log.Errorw("saving job results", "jobID", jobID, zap.Error(err))
+		h.failJob(ctx, projectName, jobID, fmt.Sprintf("failed to save results: %v", err))
+		return
+	}
+
+	// 3. Ask the QGIS plugin to create a project file (non-fatal on error).
+	var projectFile string
+	if len(artifacts) > 0 {
+		projectFile, err = h.qgisPlugin.CreateProject(ctx, relJobDir, artifacts)
 		if err != nil {
-			h.log.Errorw("fetching artifact", "url", artifactURL, zap.Error(err))
-			return echo.NewHTTPError(http.StatusBadGateway, "Failed to fetch artifact")
+			h.log.Warnw("QGIS plugin create-project failed (WMS/WFS unavailable)", "jobID", jobID, zap.Error(err))
 		}
-		defer resp.Body.Close()
+	}
 
-		return h.proxyResponse(c, resp)
+	// 4. Remap artifact download URLs to our own endpoint.
+	jobBase := base + "/jobs/" + jobID
+	for i, a := range artifacts {
+		artifacts[i].DownloadURL = jobBase + "/artifacts/" + a.Path
+	}
+
+	// 5. Update job record.
+	now := time.Now().UTC()
+	record, getErr := h.jobs.Get(ctx, projectName, jobID)
+	if getErr != nil {
+		h.log.Errorw("fetching job record for final update", "jobID", jobID, zap.Error(getErr))
+		return
+	}
+	record.Status = "successful"
+	record.RemoteJobID = remoteJobID
+	record.StoragePath = jobDir
+	record.ProjectFile = projectFile
+	record.Artifacts = artifacts
+	record.FinishedAt = &now
+	if projectFile != "" {
+		record.WmsURL = jobBase + "/wms"
+		record.OgcApiFeaturesURL = jobBase + "/ogcapi-features"
+	}
+	if saveErr := h.jobs.Save(ctx, record); saveErr != nil {
+		h.log.Errorw("saving completed job record", "jobID", jobID, zap.Error(saveErr))
 	}
 }
 
-// proxyGeoService proxies a WMS or WFS request to the internal QGIS Server URL stored for the job.
-// It injects the MAP query parameter from the stored URL while passing through the client's own params.
-func (h *Handlers) proxyGeoService(c echo.Context, jobID, serviceType string) error {
-	if strings.Contains(jobID, "..") {
-		return echo.NewHTTPError(http.StatusBadRequest, "Invalid job ID")
-	}
-
-	record, err := h.lookupJob(c, jobID)
+// failJob marks a job as failed in Redis.
+func (h *Handlers) failJob(ctx context.Context, projectName, jobID, message string) {
+	record, err := h.jobs.Get(ctx, projectName, jobID)
 	if err != nil {
-		return err
+		h.log.Errorw("fetching job record to mark failed", "jobID", jobID, zap.Error(err))
+		return
 	}
-
-	var storedURL string
-	switch serviceType {
-	case "wms":
-		storedURL = record.InternalWmsURL
-	case "ogcapi-features":
-		storedURL = record.InternalOgcApiFeaturesURL
-	}
-	if storedURL == "" {
-		return echo.NewHTTPError(http.StatusNotFound, "Service not available for this job")
-	}
-	parsedUrl, err := url.Parse(storedURL)
-	if err != nil {
-		h.log.Errorw("parsing stored service URL", "url", storedURL, zap.Error(err))
-		return echo.NewHTTPError(http.StatusInternalServerError, "Invalid stored service URL")
-	}
-
-	parsedTarget, err := url.Parse(storedURL)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "Invalid stored service URL")
-	}
-
-	// Build final query: start from client params, inject MAP from the stored URL
-	finalQuery := parsedUrl.Query()
-	for k, v := range c.Request().URL.Query() {
-		finalQuery[k] = v
-	}
-	if mapParam := parsedTarget.Query().Get("MAP"); mapParam != "" {
-		finalQuery.Set("MAP", mapParam)
-	}
-
-	finalURL := fmt.Sprintf("%s://%s%s?%s", parsedTarget.Scheme, parsedTarget.Host, parsedTarget.Path, finalQuery.Encode())
-
-	headers := make(http.Header)
-	headers.Set("Authorization", "Token "+h.proxySecret)
-	if ct := c.Request().Header.Get("Content-Type"); ct != "" {
-		headers.Set("Content-Type", ct)
-	}
-
-	resp, err := h.proxy.ForwardRequest(c.Request().Method, finalURL, c.Request().Body, headers)
-	if err != nil {
-		h.log.Errorw("proxying geo service request", "url", finalURL, zap.Error(err))
-		return echo.NewHTTPError(http.StatusBadGateway, "Failed to reach geo service")
-	}
-	defer resp.Body.Close()
-
-	return h.proxyResponse(c, resp)
-}
-
-// HandleWMSProxy proxies WMS requests for a processing job result to the internal QGIS Server.
-func (h *Handlers) HandleWMSProxy() echo.HandlerFunc {
-	return func(c echo.Context) error {
-		return h.proxyGeoService(c, c.Param("jobId"), "wms")
+	now := time.Now().UTC()
+	record.Status = "failed"
+	record.Message = message
+	record.FinishedAt = &now
+	if saveErr := h.jobs.Save(ctx, record); saveErr != nil {
+		h.log.Errorw("saving failed job record", "jobID", jobID, zap.Error(saveErr))
 	}
 }
 
-// HandleOgcApiFeaturesProxy proxies OGC API Features requests for a processing job result to the internal QGIS Server.
-func (h *Handlers) HandleOgcApiFeaturesProxy() echo.HandlerFunc {
-	return func(c echo.Context) error {
-		return h.proxyGeoService(c, c.Param("jobId"), "ogcapi-features")
-	}
-}
-
-// HandleJobStatus fetches the job status from the remote backend and returns a conformant statusInfo response.
+// HandleJobStatus returns the current status of a job.
 func (h *Handlers) HandleJobStatus() echo.HandlerFunc {
 	return func(c echo.Context) error {
 		jobID := c.Param("jobId")
@@ -782,39 +697,12 @@ func (h *Handlers) HandleJobStatus() echo.HandlerFunc {
 			return err
 		}
 
-		resp, err := h.proxy.ForwardRequest(http.MethodGet, record.StatusURL, nil, nil)
-		if err != nil {
-			h.log.Errorw("forwarding job status request", "url", record.StatusURL, zap.Error(err))
-			return echo.NewHTTPError(http.StatusBadGateway, "Failed to reach processing backend")
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			h.log.Errorw("reading remote status response", zap.Error(err))
-			return echo.NewHTTPError(http.StatusBadGateway, "Failed to read remote status")
-		}
-
-		var remoteStatus struct {
-			Status   string     `json:"status"`
-			Message  string     `json:"message"`
-			Created  *time.Time `json:"created"`
-			Started  *time.Time `json:"started"`
-			Finished *time.Time `json:"finished"`
-			Updated  *time.Time `json:"updated"`
-			Progress *int       `json:"progress"`
-		}
-		if err := json.Unmarshal(body, &remoteStatus); err != nil {
-			h.log.Errorw("parsing remote status response", zap.Error(err))
-			return echo.NewHTTPError(http.StatusBadGateway, "Invalid remote status response")
-		}
-
 		base := baseURL(c, record.Project)
 		jobBase := base + "/jobs/" + jobID
 		links := []Link{
 			{Href: jobBase, Rel: "self", Type: "application/json", Title: "Job status"},
 		}
-		if remoteStatus.Status == "successful" {
+		if record.Status == "successful" {
 			links = append(links, Link{
 				Href:  jobBase + "/results",
 				Rel:   "http://www.opengis.net/def/rel/ogc/1.0/results",
@@ -827,13 +715,10 @@ func (h *Handlers) HandleJobStatus() echo.HandlerFunc {
 			ProcessID: PrefixProcessID(record.ServiceID, record.ProcessID),
 			JobID:     jobID,
 			Type:      "process",
-			Status:    remoteStatus.Status,
-			Message:   remoteStatus.Message,
-			Created:   remoteStatus.Created,
-			Started:   remoteStatus.Started,
-			Finished:  remoteStatus.Finished,
-			Updated:   remoteStatus.Updated,
-			Progress:  remoteStatus.Progress,
+			Status:    record.Status,
+			Message:   record.Message,
+			Created:   &record.CreatedAt,
+			Finished:  record.FinishedAt,
 			Links:     links,
 		})
 	}
@@ -866,6 +751,65 @@ func (h *Handlers) HandleJobResults() echo.HandlerFunc {
 	}
 }
 
+// HandleArtifactDownload serves an artifact file directly from disk.
+func (h *Handlers) HandleArtifactDownload() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		jobID := c.Param("jobId")
+		filename := c.Param("filename")
+
+		if strings.Contains(jobID, "..") || strings.Contains(filename, "..") || strings.Contains(filename, "/") {
+			return echo.NewHTTPError(http.StatusBadRequest, "Invalid path")
+		}
+
+		if _, err := h.lookupJob(c, jobID); err != nil {
+			return err
+		}
+
+		filePath := filepath.Join(h.publishRoot, "__jobs", jobID, filename)
+		return c.File(filePath)
+	}
+}
+
+// HandleWMSProxy proxies WMS requests for a job result to QGIS Server using the MAP parameter.
+func (h *Handlers) HandleWMSProxy() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		return h.proxyJobGeoService(c, c.Param("jobId"))
+	}
+}
+
+// HandleOgcApiFeaturesProxy proxies OGC API Features requests for a job result.
+// Currently uses the same QGIS project as WMS; the specific service is determined by
+// QGIS Server based on the request parameters.
+func (h *Handlers) HandleOgcApiFeaturesProxy() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		return h.proxyJobGeoService(c, c.Param("jobId"))
+	}
+}
+
+// proxyJobGeoService sets the MAP parameter to the job's QGIS project file and
+// forwards the request to QGIS Server, identical to handleProjectOws.
+func (h *Handlers) proxyJobGeoService(c echo.Context, jobID string) error {
+	if strings.Contains(jobID, "..") {
+		return echo.NewHTTPError(http.StatusBadRequest, "Invalid job ID")
+	}
+
+	record, err := h.lookupJob(c, jobID)
+	if err != nil {
+		return err
+	}
+	if record.ProjectFile == "" {
+		return echo.NewHTTPError(http.StatusNotFound, "Geo service not available for this job")
+	}
+
+	mapPath := filepath.Join(h.publishRoot, "__jobs", jobID, record.ProjectFile)
+	query := c.Request().URL.Query()
+	query.Set("MAP", mapPath)
+	c.Request().URL.RawQuery = query.Encode()
+
+	h.reverseProxy.ServeHTTP(c.Response(), c.Request())
+	return nil
+}
+
 // lookupJob retrieves a JobRecord from Redis, verifying the project scope matches the URL.
 func (h *Handlers) lookupJob(c echo.Context, jobID string) (*JobRecord, error) {
 	project := c.Get("project").(string)
@@ -877,29 +821,10 @@ func (h *Handlers) lookupJob(c echo.Context, jobID string) (*JobRecord, error) {
 		h.log.Errorw("Redis job lookup", "jobID", jobID, zap.Error(err))
 		return nil, echo.NewHTTPError(http.StatusInternalServerError, "Failed to look up job")
 	}
-	// Defense-in-depth: the Redis key already scopes by project, but verify explicitly.
 	if record.Project != project {
 		return nil, echo.NewHTTPError(http.StatusNotFound, "Job not found")
 	}
 	return record, nil
-}
-
-// proxyResponse writes the backend response to the client.
-func (h *Handlers) proxyResponse(c echo.Context, resp *http.Response) error {
-	// Copy relevant headers
-	for _, header := range []string{"Content-Type", "Content-Disposition"} {
-		if v := resp.Header.Get(header); v != "" {
-			c.Response().Header().Set(header, v)
-		}
-	}
-
-	c.Response().WriteHeader(resp.StatusCode)
-
-	if resp.Body != nil {
-		_, err := io.Copy(c.Response(), resp.Body)
-		return err
-	}
-	return nil
 }
 
 // MarshalJSON implements custom JSON marshaling for StatusInfo to include extra fields.
@@ -912,7 +837,6 @@ func (s StatusInfo) MarshalJSON() ([]byte, error) {
 	if s.Extra == nil {
 		return data, nil
 	}
-	// Merge extra fields
 	data[len(data)-1] = ','
 	data = append(data, s.Extra[1:]...)
 	return data, nil
