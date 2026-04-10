@@ -29,14 +29,14 @@ func NewQGISPluginClient(mapserverURL, secret string) *QGISPluginClient {
 }
 
 // createProjectURL derives the plugin endpoint from the mapserver URL.
-// The new plugin is mounted at /qgis-server/qgis_mapserv.fcgi/ogc/create-project
+// The new plugin is mounted at /qgis-server/qgis_mapserv.fcgi/ogc/gisquick-project-from-file
 // on the same QGIS Server instance.
 func (q *QGISPluginClient) createProjectURL() (string, error) {
 	parsed, err := url.Parse(q.mapserverURL)
 	if err != nil {
 		return "", fmt.Errorf("parsing mapserverURL: %w", err)
 	}
-	return fmt.Sprintf("%s://%s/qgis-server/qgis_mapserv.fcgi/ogc/create-project", parsed.Scheme, parsed.Host), nil
+	return fmt.Sprintf("%s://%s/qgis-server/qgis_mapserv.fcgi/ogc/gisquick-project-from-file", parsed.Scheme, parsed.Host), nil
 }
 
 // CreateProject asks the QGIS plugin to create a project file from the given artifacts.
@@ -66,12 +66,12 @@ func (q *QGISPluginClient) CreateProject(ctx context.Context, jobDir, serviceURL
 	}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("marshaling create-project request: %w", err)
+		return "", fmt.Errorf("marshaling gisquick-project-from-file request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return "", fmt.Errorf("building create-project request: %w", err)
+		return "", fmt.Errorf("building gisquick-project-from-file request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if q.secret != "" {
@@ -80,25 +80,25 @@ func (q *QGISPluginClient) CreateProject(ctx context.Context, jobDir, serviceURL
 
 	resp, err := q.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("calling create-project plugin: %w", err)
+		return "", fmt.Errorf("calling gisquick-project-from-file plugin: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("reading create-project response: %w", err)
+		return "", fmt.Errorf("reading gisquick-project-from-file response: %w", err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("create-project plugin returned status %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("gisquick-project-from-file plugin returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result QGISCreateProjectResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return "", fmt.Errorf("decoding create-project response: %w", err)
+		return "", fmt.Errorf("decoding gisquick-project-from-file response: %w", err)
 	}
 	if result.ProjectFile == "" {
-		return "", fmt.Errorf("create-project plugin returned empty project_file")
+		return "", fmt.Errorf("gisquick-project-from-file plugin returned empty project_file")
 	}
 	return result.ProjectFile, nil
 }
