@@ -783,7 +783,9 @@ func (h *Handlers) proxyJobGeoService() echo.HandlerFunc {
 		query := req.URL.Query()
 		query.Set("MAP", mapPath)
 		req.URL.RawQuery = query.Encode()
-		if strings.EqualFold(query.Get("SERVICE"), "WMS") && strings.EqualFold(query.Get("REQUEST"), "GetCapabilities") {
+		service := query.Get("SERVICE")
+		if strings.EqualFold(query.Get("REQUEST"), "GetCapabilities") &&
+			(strings.EqualFold(service, "WMS") || strings.EqualFold(service, "WFS")) {
 			req.Header.Set("X-Ows-Url", req.URL.Path)
 			capabilitiesProxy.ServeHTTP(c.Response(), req)
 		} else {
