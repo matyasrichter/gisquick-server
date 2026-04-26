@@ -303,12 +303,17 @@ func (h *Handlers) HandleUpdateProcessingService() echo.HandlerFunc {
 		updated.ID = serviceID
 
 		if updated.Type == domain.ProcessingServiceTypeOGCProcesses {
-			fetched, err := h.fetchRemoteProcesses(updated.URL)
-			if err != nil {
-				h.log.Errorw("fetching remote process descriptions", "url", updated.URL, zap.Error(err))
-				return echo.NewHTTPError(http.StatusBadGateway, "Failed to fetch process descriptions from remote")
+			existing := cfg.Services[idx].Processes
+			merged := make(map[string]domain.ProcessConfig, len(req.Processes))
+			for id, override := range req.Processes {
+				proc, ok := existing[id]
+				if !ok {
+					continue
+				}
+				proc.Remote = override.Remote
+				merged[id] = proc
 			}
-			updated.Processes = mergeProcessConfigs(fetched, req.Processes)
+			updated.Processes = merged
 		}
 
 		cfg.Services[idx] = updated
