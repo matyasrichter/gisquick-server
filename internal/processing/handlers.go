@@ -133,10 +133,11 @@ func ogcServices(cfg domain.ProcessingConfig) []domain.ProcessingService {
 
 // serviceRequest is the shared request body for processing service CRUD operations.
 type serviceRequest struct {
-	URL       string                          `json:"url"`
-	Type      domain.ProcessingServiceType    `json:"type"`
-	Name      string                          `json:"name"`
-	Processes map[string]domain.ProcessConfig `json:"processes,omitempty"`
+	URL       string                       `json:"url"`
+	Type      domain.ProcessingServiceType `json:"type"`
+	Name      string                       `json:"name"`
+	Headers   map[string]string            `json:"headers,omitempty"`
+	Processes []string                     `json:"processes,omitempty"` // process IDs to retain
 }
 
 func (r *serviceRequest) validate() error {
@@ -151,10 +152,10 @@ func (r *serviceRequest) validate() error {
 
 func (r *serviceRequest) toService() domain.ProcessingService {
 	return domain.ProcessingService{
-		URL:       r.URL,
-		Type:      r.Type,
-		Name:      r.Name,
-		Processes: r.Processes,
+		URL:     r.URL,
+		Type:    r.Type,
+		Name:    r.Name,
+		Headers: r.Headers,
 	}
 }
 
@@ -166,10 +167,12 @@ type remoteProcessList struct {
 }
 
 // fetchRemoteProcesses retrieves the full process descriptions from an OGC API backend.
-func (h *Handlers) fetchRemoteProcesses(svcURL string) (map[string]domain.ProcessConfig, error) {
+// The provided headers are forwarded on every request (e.g. for authentication).
+func (h *Handlers) fetchRemoteProcesses(svcURL string, svcHeaders map[string]string) (map[string]domain.ProcessConfig, error) {
 	base := strings.TrimRight(svcURL, "/")
+	fwdHeaders := toHTTPHeader(svcHeaders)
 
-	resp, err := h.ogcClient.ForwardRequest(http.MethodGet, base+"/processes", nil, nil)
+	resp, err := h.ogcClient.ForwardRequest(http.MethodGet, base+"/processes", nil, fwdHeaders)
 	if err != nil {
 		return nil, fmt.Errorf("fetching process list: %w", err)
 	}
@@ -185,7 +188,7 @@ func (h *Handlers) fetchRemoteProcesses(svcURL string) (map[string]domain.Proces
 
 	result := make(map[string]domain.ProcessConfig, len(list.Processes))
 	for _, p := range list.Processes {
-		descResp, err := h.ogcClient.ForwardRequest(http.MethodGet, base+"/processes/"+p.ID, nil, nil)
+		descResp, err := h.ogcClient.ForwardRequest(http.MethodGet, base+"/processes/"+p.ID, nil, fwdHeaders)
 		if err != nil {
 			return nil, fmt.Errorf("fetching process %q: %w", p.ID, err)
 		}
@@ -212,15 +215,16 @@ func (h *Handlers) fetchRemoteProcesses(svcURL string) (map[string]domain.Proces
 	return result, nil
 }
 
-// mergeProcessConfigs builds the final process map by overlaying user-provided proxy configs.
-func mergeProcessConfigs(fetched map[string]domain.ProcessConfig, overrides map[string]domain.ProcessConfig) map[string]domain.ProcessConfig {
-	for id, override := range overrides {
-		if cfg, ok := fetched[id]; ok {
-			cfg.Remote = override.Remote
-			fetched[id] = cfg
-		}
+// toHTTPHeader converts a map[string]string to http.Header.
+func toHTTPHeader(m map[string]string) http.Header {
+	if len(m) == 0 {
+		return nil
 	}
-	return fetched
+	h := make(http.Header, len(m))
+	for k, v := range m {
+		h.Set(k, v)
+	}
+	return h
 }
 
 // HandleAddProcessingService handles POST requests to append a processing service.
@@ -250,12 +254,12 @@ func (h *Handlers) HandleAddProcessingService() echo.HandlerFunc {
 		svc.ID = id.String()
 
 		if svc.Type == domain.ProcessingServiceTypeOGCProcesses {
-			fetched, err := h.fetchRemoteProcesses(svc.URL)
+			fetched, err := h.fetchRemoteProcesses(svc.URL, svc.Headers)
 			if err != nil {
 				h.log.Errorw("fetching remote process descriptions", "url", svc.URL, zap.Error(err))
 				return echo.NewHTTPError(http.StatusBadGateway, "Failed to fetch process descriptions from remote")
 			}
-			svc.Processes = mergeProcessConfigs(fetched, req.Processes)
+			svc.Processes = fetched
 		}
 
 		cfg.Services = append(cfg.Services, svc)
@@ -304,16 +308,13 @@ func (h *Handlers) HandleUpdateProcessingService() echo.HandlerFunc {
 
 		if updated.Type == domain.ProcessingServiceTypeOGCProcesses {
 			existing := cfg.Services[idx].Processes
-			merged := make(map[string]domain.ProcessConfig, len(req.Processes))
-			for id, override := range req.Processes {
-				proc, ok := existing[id]
-				if !ok {
-					continue
+			kept := make(map[string]domain.ProcessConfig, len(req.Processes))
+			for _, id := range req.Processes {
+				if proc, ok := existing[id]; ok {
+					kept[id] = proc
 				}
-				proc.Remote = override.Remote
-				merged[id] = proc
 			}
-			updated.Processes = merged
+			updated.Processes = kept
 		}
 
 		cfg.Services[idx] = updated
@@ -402,12 +403,12 @@ func (h *Handlers) HandleSyncProcessingService() echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, "Only OGC API Processes services support sync")
 		}
 
-		fetched, err := h.fetchRemoteProcesses(svc.URL)
+		fetched, err := h.fetchRemoteProcesses(svc.URL, svc.Headers)
 		if err != nil {
 			h.log.Errorw("syncing remote process descriptions", "url", svc.URL, zap.Error(err))
 			return echo.NewHTTPError(http.StatusBadGateway, "Failed to fetch process descriptions from remote")
 		}
-		svc.Processes = mergeProcessConfigs(fetched, svc.Processes)
+		svc.Processes = fetched
 		cfg.Services[idx] = svc
 
 		if err := h.projects.UpdateProcessingConfig(projectName, cfg); err != nil {
@@ -591,13 +592,10 @@ func (h *Handlers) HandleExecute() echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, "Failed to read request body")
 		}
 
-		// Build the remote config, defaulting ExecuteURL if not set.
-		remote := procCfg.Remote
-		if remote.ExecuteURL == "" {
-			remote.ExecuteURL = strings.TrimRight(svc.URL, "/") + "/processes/" + originalID + "/execution"
-		}
-		if remote.Type == "" {
-			remote.Type = string(svc.Type)
+		remote := domain.RemoteConfig{
+			ExecuteURL: strings.TrimRight(svc.URL, "/") + "/processes/" + originalID + "/execution",
+			Type:       string(svc.Type),
+			Headers:    svc.Headers,
 		}
 
 		jobUUID, err := uuid.NewV4()

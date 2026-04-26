@@ -221,11 +221,10 @@ type RemoteConfig struct {
 	Headers    map[string]string `json:"headers,omitempty"`
 }
 
-// ProcessConfig holds the proxy configuration for a specific process.
+// ProcessConfig holds the stored description for a specific process.
 type ProcessConfig struct {
 	Title       string          `json:"title,omitempty"`
 	Description json.RawMessage `json:"description,omitempty"` // full OGC API process description, stored at registration time
-	Remote      RemoteConfig    `json:"remote"`
 }
 
 // ProcessingService represents a configured processing backend.
@@ -234,6 +233,7 @@ type ProcessingService struct {
 	URL       string                   `json:"url"`
 	Type      ProcessingServiceType    `json:"type"`
 	Name      string                   `json:"name,omitempty"`
+	Headers   map[string]string        `json:"headers,omitempty"`
 	Processes map[string]ProcessConfig `json:"processes,omitempty"`
 }
 
