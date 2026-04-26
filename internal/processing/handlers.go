@@ -368,6 +368,51 @@ func (h *Handlers) HandleGetProcessingConfig() echo.HandlerFunc {
 	}
 }
 
+// HandleSyncProcessingService re-fetches all process descriptions from the
+// remote OGC API endpoint and merges them with existing per-process overrides.
+func (h *Handlers) HandleSyncProcessingService() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		projectName := c.Get("project").(string)
+		serviceID := c.Param("id")
+
+		cfg, err := h.projects.GetProcessingConfig(projectName)
+		if err != nil {
+			h.log.Errorw("reading processing config", "project", projectName, zap.Error(err))
+			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to read processing config")
+		}
+
+		idx := -1
+		for i, s := range cfg.Services {
+			if s.ID == serviceID {
+				idx = i
+				break
+			}
+		}
+		if idx == -1 {
+			return echo.NewHTTPError(http.StatusNotFound, "Service not found")
+		}
+
+		svc := cfg.Services[idx]
+		if svc.Type != domain.ProcessingServiceTypeOGCProcesses {
+			return echo.NewHTTPError(http.StatusBadRequest, "Only OGC API Processes services support sync")
+		}
+
+		fetched, err := h.fetchRemoteProcesses(svc.URL)
+		if err != nil {
+			h.log.Errorw("syncing remote process descriptions", "url", svc.URL, zap.Error(err))
+			return echo.NewHTTPError(http.StatusBadGateway, "Failed to fetch process descriptions from remote")
+		}
+		svc.Processes = mergeProcessConfigs(fetched, svc.Processes)
+		cfg.Services[idx] = svc
+
+		if err := h.projects.UpdateProcessingConfig(projectName, cfg); err != nil {
+			h.log.Errorw("saving processing config", "project", projectName, zap.Error(err))
+			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to save processing config")
+		}
+		return c.JSON(http.StatusOK, cfg)
+	}
+}
+
 // HandleLandingPage returns the OGC API Processes landing page.
 func (h *Handlers) HandleLandingPage() echo.HandlerFunc {
 	return func(c echo.Context) error {

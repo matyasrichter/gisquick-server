@@ -149,6 +149,7 @@ func (s *Server) AddRoutes(e *echo.Echo) {
 	e.PUT("/api/project/processing/:user/:name/:id", procHandlers.HandleUpdateProcessingService(), ProjectAdminAccess)
 	e.DELETE("/api/project/processing/:user/:name/:id", procHandlers.HandleDeleteProcessingService(), ProjectAdminAccess)
 	e.GET("/api/project/processing/:user/:name", procHandlers.HandleGetProcessingConfig(), ProjectAdminAccess)
+	e.POST("/api/project/processing/:user/:name/:id/sync", procHandlers.HandleSyncProcessingService(), ProjectAdminAccess)
 
 	// OGC API - Processes proxy endpoints
 	e.GET("/api/map/ogc-processes/:user/:name", procHandlers.HandleLandingPage(), ProjectAccess)
