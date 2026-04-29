@@ -225,6 +225,122 @@ type wps1LiteralOutput struct {
 }
 
 // ---------------------------------------------------------------------------
+// WPS 1.0 XML structs — Execute request
+// ---------------------------------------------------------------------------
+
+type wps1ExecuteRequest struct {
+	XMLName      xml.Name          `xml:"wps:Execute"`
+	WPSNs        string            `xml:"xmlns:wps,attr"`
+	OWSNs        string            `xml:"xmlns:ows,attr"`
+	Version      string            `xml:"version,attr"`
+	Service      string            `xml:"service,attr"`
+	Identifier   wpsExecIdentifier `xml:"ows:Identifier"`
+	DataInputs   wps1DataInputsReq `xml:"wps:DataInputs"`
+	ResponseForm wps1ResponseForm  `xml:"wps:ResponseForm"`
+}
+
+type wps1DataInputsReq struct {
+	Inputs []wps1InputElem `xml:"wps:Input"`
+}
+
+type wps1InputElem struct {
+	Identifier wpsExecIdentifier `xml:"ows:Identifier"`
+	Data       wps1DataElem      `xml:"wps:Data"`
+}
+
+type wps1DataElem struct {
+	LiteralData *wpsExecLiteralData  `xml:"wps:LiteralData"`
+	ComplexData *wpsExecComplexData  `xml:"wps:ComplexData"`
+	BoundingBox *wps1ExecBoundingBox `xml:"wps:BoundingBoxData"`
+}
+
+type wps1ExecBoundingBox struct {
+	CRS         string `xml:"crs,attr"`
+	LowerCorner string `xml:"ows:LowerCorner"`
+	UpperCorner string `xml:"ows:UpperCorner"`
+}
+
+type wps1ResponseForm struct {
+	ResponseDocument *wps1ResponseDocument `xml:"wps:ResponseDocument"`
+}
+
+type wps1ResponseDocument struct {
+	Status               string          `xml:"status,attr"`
+	StoreExecuteResponse string          `xml:"storeExecuteResponse,attr"`
+	Outputs              []wps1OutputReq `xml:"wps:Output"`
+}
+
+type wps1OutputReq struct {
+	AsReference string            `xml:"asReference,attr"`
+	Identifier  wpsExecIdentifier `xml:"ows:Identifier"`
+}
+
+// ---------------------------------------------------------------------------
+// WPS 1.0 XML structs — ExecuteResponse
+// ---------------------------------------------------------------------------
+
+type wps1ExecuteResponse struct {
+	XMLName        xml.Name                 `xml:"http://www.opengis.net/wps/1.0.0 ExecuteResponse"`
+	StatusLocation string                   `xml:"statusLocation,attr"`
+	Status         wps1Status               `xml:"http://www.opengis.net/wps/1.0.0 Status"`
+	ProcessOutputs wps1ProcessOutputsResult `xml:"http://www.opengis.net/wps/1.0.0 ProcessOutputs"`
+}
+
+type wps1Status struct {
+	ProcessAccepted  *string             `xml:"http://www.opengis.net/wps/1.0.0 ProcessAccepted"`
+	ProcessStarted   *wps1ProcessStarted `xml:"http://www.opengis.net/wps/1.0.0 ProcessStarted"`
+	ProcessPaused    *string             `xml:"http://www.opengis.net/wps/1.0.0 ProcessPaused"`
+	ProcessSucceeded *string             `xml:"http://www.opengis.net/wps/1.0.0 ProcessSucceeded"`
+	ProcessFailed    *wps1ProcessFailed  `xml:"http://www.opengis.net/wps/1.0.0 ProcessFailed"`
+}
+
+type wps1ProcessStarted struct {
+	Value            string `xml:",chardata"`
+	PercentCompleted int    `xml:"percentCompleted,attr"`
+}
+
+type wps1ProcessFailed struct {
+	ExceptionReport wps1ExceptionReport `xml:"http://www.opengis.net/ows/1.1 ExceptionReport"`
+}
+
+type wps1ExceptionReport struct {
+	Exception wps1Exception `xml:"http://www.opengis.net/ows/1.1 Exception"`
+}
+
+type wps1Exception struct {
+	ExceptionText string `xml:"http://www.opengis.net/ows/1.1 ExceptionText"`
+}
+
+type wps1ProcessOutputsResult struct {
+	Outputs []wps1OutputResult `xml:"http://www.opengis.net/wps/1.0.0 Output"`
+}
+
+type wps1OutputResult struct {
+	Identifier owsIdentifier         `xml:"http://www.opengis.net/ows/1.1 Identifier"`
+	Data       *wps1OutputDataResult `xml:"http://www.opengis.net/wps/1.0.0 Data"`
+	Reference  *wps1OutputReference  `xml:"http://www.opengis.net/wps/1.0.0 Reference"`
+}
+
+type wps1OutputDataResult struct {
+	LiteralData *wps1LiteralDataResult `xml:"http://www.opengis.net/wps/1.0.0 LiteralData"`
+	ComplexData *wps1ComplexDataResult `xml:"http://www.opengis.net/wps/1.0.0 ComplexData"`
+}
+
+type wps1LiteralDataResult struct {
+	Value string `xml:",chardata"`
+}
+
+type wps1ComplexDataResult struct {
+	MimeType string `xml:"mimeType,attr"`
+	Value    string `xml:",chardata"`
+}
+
+type wps1OutputReference struct {
+	Href     string `xml:"href,attr"`
+	MimeType string `xml:"mimeType,attr"`
+}
+
+// ---------------------------------------------------------------------------
 // WPSBackend
 // ---------------------------------------------------------------------------
 
@@ -1154,6 +1270,120 @@ func wps1LiteralOutputSchema(lo *wps1LiteralOutput) map[string]any {
 		dt = lo.DataType.Value
 	}
 	return map[string]any{"type": literalDataType(dt)}
+}
+
+// buildWPS1ExecuteXML marshals a WPS 1.0 Execute request from OGC API JSON inputs.
+// outputIDs must list the expected output identifiers (required by WPS 1.0 ResponseDocument).
+func (b *WPSBackend) buildWPS1ExecuteXML(processID, mode string, inputs json.RawMessage, outputIDs []string) ([]byte, error) {
+	var wrapper struct {
+		Inputs map[string]json.RawMessage `json:"inputs"`
+	}
+	if err := json.Unmarshal(inputs, &wrapper); err != nil {
+		return nil, fmt.Errorf("parsing inputs JSON: %w", err)
+	}
+
+	var inputElems []wps1InputElem
+	for id, rawVal := range wrapper.Inputs {
+		elem, err := buildWPS1InputElement(id, rawVal)
+		if err != nil {
+			return nil, fmt.Errorf("translating input %q: %w", id, err)
+		}
+		inputElems = append(inputElems, elem)
+	}
+
+	outputReqs := make([]wps1OutputReq, 0, len(outputIDs))
+	for _, id := range outputIDs {
+		outputReqs = append(outputReqs, wps1OutputReq{
+			AsReference: "false",
+			Identifier:  wpsExecIdentifier{Value: id},
+		})
+	}
+
+	storeAndStatus := "false"
+	if mode == "async" {
+		storeAndStatus = "true"
+	}
+
+	exec := wps1ExecuteRequest{
+		WPSNs:   "http://www.opengis.net/wps/1.0.0",
+		OWSNs:   "http://www.opengis.net/ows/1.1",
+		Version: "1.0.0",
+		Service: "WPS",
+		Identifier: wpsExecIdentifier{Value: processID},
+		DataInputs: wps1DataInputsReq{Inputs: inputElems},
+		ResponseForm: wps1ResponseForm{
+			ResponseDocument: &wps1ResponseDocument{
+				Status:               storeAndStatus,
+				StoreExecuteResponse: storeAndStatus,
+				Outputs:              outputReqs,
+			},
+		},
+	}
+
+	out, err := xml.MarshalIndent(exec, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(xml.Header), out...), nil
+}
+
+// buildWPS1InputElement converts a single OGC API JSON input value to wps1InputElem.
+func buildWPS1InputElement(id string, raw json.RawMessage) (wps1InputElem, error) {
+	var val any
+	if err := json.Unmarshal(raw, &val); err != nil {
+		return wps1InputElem{}, fmt.Errorf("parsing value: %w", err)
+	}
+	elem := wps1InputElem{Identifier: wpsExecIdentifier{Value: id}}
+
+	switch v := val.(type) {
+	case map[string]any:
+		elem.Data = wps1DataElem{
+			ComplexData: &wpsExecComplexData{MimeType: "application/geo+json", Value: string(raw)},
+		}
+	case []any:
+		if isBBoxArray(v) {
+			nums := make([]float64, len(v))
+			for i, n := range v {
+				nums[i] = n.(float64)
+			}
+			half := len(nums) / 2
+			lowerParts := make([]string, half)
+			upperParts := make([]string, half)
+			for i := 0; i < half; i++ {
+				lowerParts[i] = fmt.Sprintf("%g", nums[i])
+				upperParts[i] = fmt.Sprintf("%g", nums[half+i])
+			}
+			elem.Data = wps1DataElem{
+				BoundingBox: &wps1ExecBoundingBox{
+					CRS:         "EPSG:4326",
+					LowerCorner: strings.Join(lowerParts, " "),
+					UpperCorner: strings.Join(upperParts, " "),
+				},
+			}
+		} else {
+			elem.Data = wps1DataElem{
+				ComplexData: &wpsExecComplexData{MimeType: "application/json", Value: string(raw)},
+			}
+		}
+	default:
+		var s string
+		switch tv := v.(type) {
+		case string:
+			s = tv
+		case float64:
+			s = fmt.Sprintf("%g", tv)
+		case bool:
+			if tv {
+				s = "true"
+			} else {
+				s = "false"
+			}
+		default:
+			s = string(raw)
+		}
+		elem.Data = wps1DataElem{LiteralData: &wpsExecLiteralData{Value: s}}
+	}
+	return elem, nil
 }
 
 func parseWPS1ProcessDescription(body []byte, processID string) (*ProcessDescription, error) {
