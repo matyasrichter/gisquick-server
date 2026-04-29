@@ -51,7 +51,7 @@ type owsKeywords struct {
 // ---------------------------------------------------------------------------
 
 type wpsProcessOfferings struct {
-	XMLName   xml.Name            `xml:"http://www.opengis.net/wps/2.0 ProcessOfferings"`
+	XMLName   xml.Name             `xml:"http://www.opengis.net/wps/2.0 ProcessOfferings"`
 	Offerings []wpsProcessOffering `xml:"http://www.opengis.net/wps/2.0 ProcessOffering"`
 }
 
@@ -69,20 +69,20 @@ type wpsProcess struct {
 }
 
 type wpsInput struct {
-	Identifier      owsIdentifier    `xml:"http://www.opengis.net/ows/1.1 Identifier"`
-	Title           string           `xml:"http://www.opengis.net/ows/1.1 Title"`
-	Abstract        string           `xml:"http://www.opengis.net/ows/1.1 Abstract"`
-	LiteralData     *wpsLiteralData  `xml:"http://www.opengis.net/wps/2.0 LiteralData"`
-	ComplexData     *wpsComplexData  `xml:"http://www.opengis.net/wps/2.0 ComplexData"`
+	Identifier      owsIdentifier       `xml:"http://www.opengis.net/ows/1.1 Identifier"`
+	Title           string              `xml:"http://www.opengis.net/ows/1.1 Title"`
+	Abstract        string              `xml:"http://www.opengis.net/ows/1.1 Abstract"`
+	LiteralData     *wpsLiteralData     `xml:"http://www.opengis.net/wps/2.0 LiteralData"`
+	ComplexData     *wpsComplexData     `xml:"http://www.opengis.net/wps/2.0 ComplexData"`
 	BoundingBoxData *wpsBoundingBoxData `xml:"http://www.opengis.net/wps/2.0 BoundingBoxData"`
 }
 
 type wpsOutput struct {
-	Identifier      owsIdentifier    `xml:"http://www.opengis.net/ows/1.1 Identifier"`
-	Title           string           `xml:"http://www.opengis.net/ows/1.1 Title"`
-	Abstract        string           `xml:"http://www.opengis.net/ows/1.1 Abstract"`
-	LiteralData     *wpsLiteralData  `xml:"http://www.opengis.net/wps/2.0 LiteralData"`
-	ComplexData     *wpsComplexData  `xml:"http://www.opengis.net/wps/2.0 ComplexData"`
+	Identifier      owsIdentifier       `xml:"http://www.opengis.net/ows/1.1 Identifier"`
+	Title           string              `xml:"http://www.opengis.net/ows/1.1 Title"`
+	Abstract        string              `xml:"http://www.opengis.net/ows/1.1 Abstract"`
+	LiteralData     *wpsLiteralData     `xml:"http://www.opengis.net/wps/2.0 LiteralData"`
+	ComplexData     *wpsComplexData     `xml:"http://www.opengis.net/wps/2.0 ComplexData"`
 	BoundingBoxData *wpsBoundingBoxData `xml:"http://www.opengis.net/wps/2.0 BoundingBoxData"`
 }
 
@@ -116,7 +116,7 @@ type wpsBoundingBoxData struct{}
 // ---------------------------------------------------------------------------
 
 type wps1Capabilities struct {
-	XMLName          xml.Name             `xml:"http://www.opengis.net/wps/1.0.0 WPS_Capabilities"`
+	XMLName          xml.Name             `xml:"http://www.opengis.net/wps/1.0.0 Capabilities"`
 	Version          string               `xml:"version,attr"`
 	ProcessOfferings wps1ProcessOfferings `xml:"http://www.opengis.net/wps/1.0.0 ProcessOfferings"`
 }
@@ -379,9 +379,9 @@ type wpsInputElement struct {
 }
 
 type wpsDataElem struct {
-	LiteralData  *wpsExecLiteralData  `xml:"wps:LiteralData"`
-	ComplexData  *wpsExecComplexData  `xml:"wps:ComplexData"`
-	BoundingBox  *wpsExecBoundingBox  `xml:"wps:BoundingBoxData"`
+	LiteralData *wpsExecLiteralData `xml:"wps:LiteralData"`
+	ComplexData *wpsExecComplexData `xml:"wps:ComplexData"`
+	BoundingBox *wpsExecBoundingBox `xml:"wps:BoundingBoxData"`
 }
 
 type wpsExecLiteralData struct {
@@ -394,7 +394,7 @@ type wpsExecComplexData struct {
 }
 
 type wpsExecBoundingBox struct {
-	CRS        string `xml:"crs,attr"`
+	CRS         string `xml:"crs,attr"`
 	LowerCorner string `xml:"ows:LowerCorner"`
 	UpperCorner string `xml:"ows:UpperCorner"`
 }
@@ -421,14 +421,14 @@ type wpsResultResponse struct {
 }
 
 type wpsOutputElement struct {
-	ID        string       `xml:"id,attr"`
-	Data      *wpsDataOut  `xml:"http://www.opengis.net/wps/2.0 Data"`
-	Reference *wpsRefOut   `xml:"http://www.opengis.net/wps/2.0 Reference"`
+	ID        string      `xml:"id,attr"`
+	Data      *wpsDataOut `xml:"http://www.opengis.net/wps/2.0 Data"`
+	Reference *wpsRefOut  `xml:"http://www.opengis.net/wps/2.0 Reference"`
 }
 
 type wpsDataOut struct {
-	LiteralData *wpsLiteralDataOut  `xml:"http://www.opengis.net/wps/2.0 LiteralData"`
-	ComplexData *wpsComplexDataOut  `xml:"http://www.opengis.net/wps/2.0 ComplexData"`
+	LiteralData *wpsLiteralDataOut `xml:"http://www.opengis.net/wps/2.0 LiteralData"`
+	ComplexData *wpsComplexDataOut `xml:"http://www.opengis.net/wps/2.0 ComplexData"`
 }
 
 type wpsLiteralDataOut struct {
@@ -1003,14 +1003,14 @@ func (b *WPSBackend) buildExecuteXML(processID, mode string, inputs json.RawMess
 	}
 
 	exec := wpsExecuteRequest{
-		WPSNs:   "http://www.opengis.net/wps/2.0",
-		OWSNs:   "http://www.opengis.net/ows/1.1",
-		Service:  "WPS",
-		Version:  "2.0.0",
-		Mode:     mode,
-		Response: "document",
+		WPSNs:      "http://www.opengis.net/wps/2.0",
+		OWSNs:      "http://www.opengis.net/ows/1.1",
+		Service:    "WPS",
+		Version:    "2.0.0",
+		Mode:       mode,
+		Response:   "document",
 		Identifier: wpsExecIdentifier{Value: processID},
-		Inputs:   inputElems,
+		Inputs:     inputElems,
 		// Omit Outputs to request all outputs; WPS servers return everything by default.
 	}
 
@@ -1497,10 +1497,10 @@ func (b *WPSBackend) buildWPS1ExecuteXML(processID, mode string, inputs json.Raw
 	}
 
 	exec := wps1ExecuteRequest{
-		WPSNs:   "http://www.opengis.net/wps/1.0.0",
-		OWSNs:   "http://www.opengis.net/ows/1.1",
-		Version: "1.0.0",
-		Service: "WPS",
+		WPSNs:      "http://www.opengis.net/wps/1.0.0",
+		OWSNs:      "http://www.opengis.net/ows/1.1",
+		Version:    "1.0.0",
+		Service:    "WPS",
 		Identifier: wpsExecIdentifier{Value: processID},
 		DataInputs: wps1DataInputsReq{Inputs: inputElems},
 		ResponseForm: wps1ResponseForm{
