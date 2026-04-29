@@ -13,12 +13,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// XML namespace constants for WPS 2.0 and OWS 1.1.
-const (
-	nsWPS = "http://www.opengis.net/wps/2.0"
-	nsOWS = "http://www.opengis.net/ows/1.1"
-)
-
 // ---------------------------------------------------------------------------
 // WPS 2.0.2 XML structs — GetCapabilities response
 // ---------------------------------------------------------------------------
