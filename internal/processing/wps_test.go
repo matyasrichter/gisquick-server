@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gisquick/gisquick-server/internal/domain"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
 
@@ -468,6 +470,46 @@ func TestLiteralDataType(t *testing.T) {
 			if got != tc.expected {
 				t.Errorf("literalDataType(%q) = %q, want %q", tc.input, got, tc.expected)
 			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// wpsDetectMajorVersion
+// ---------------------------------------------------------------------------
+
+func TestWPSDetectVersion(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantMajor int
+	}{
+		{
+			name:      "wps 2.0.0",
+			body:      `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/2.0" version="2.0.0" service="WPS"></wps:Capabilities>`,
+			wantMajor: 2,
+		},
+		{
+			name:      "wps 2.0.2",
+			body:      `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/2.0" version="2.0.2" service="WPS"></wps:Capabilities>`,
+			wantMajor: 2,
+		},
+		{
+			name:      "wps 1.0.0",
+			body:      `<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0" version="1.0.0" service="WPS"></wps:WPS_Capabilities>`,
+			wantMajor: 1,
+		},
+		{
+			name:      "wps 1.3.0",
+			body:      `<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0" version="1.3.0" service="WPS"></wps:WPS_Capabilities>`,
+			wantMajor: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := wpsDetectMajorVersion([]byte(tc.body))
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantMajor, got)
 		})
 	}
 }

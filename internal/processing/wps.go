@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gisquick/gisquick-server/internal/domain"
@@ -114,11 +115,12 @@ type wpsBoundingBoxData struct{}
 // WPSBackend
 // ---------------------------------------------------------------------------
 
-// WPSBackend implements ProcessingBackend for OGC WPS 2.0.2 services.
+// WPSBackend implements ProcessingBackend for OGC WPS services (versions 1.x and 2.x).
 type WPSBackend struct {
 	client       *http.Client
 	log          *zap.SugaredLogger
 	pollInterval time.Duration // overridable in tests; zero → use initialPollInterval
+	versionCache sync.Map      // map[serviceURL string]int (1 or 2)
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +232,55 @@ func wpsQueryURL(base, request, identifier string) string {
 // (GetStatus, GetResult) that use a jobId parameter instead of identifier.
 func wpsJobURL(base, request, jobID string) string {
 	return base + "?service=WPS&version=2.0.0&request=" + request + "&jobId=" + url.QueryEscape(jobID)
+}
+
+// wpsDetectMajorVersion parses the version attribute from the root element of a
+// WPS GetCapabilities response body and returns the major version number (1 or 2).
+// Any 1.x version returns 1; 2.x (including 2.0.2) returns 2.
+func wpsDetectMajorVersion(body []byte) (int, error) {
+	type versionRoot struct {
+		Version string `xml:"version,attr"`
+	}
+	var r versionRoot
+	if err := xml.Unmarshal(body, &r); err != nil {
+		return 0, fmt.Errorf("parsing WPS capabilities version: %w", err)
+	}
+	if strings.HasPrefix(r.Version, "1.") {
+		return 1, nil
+	}
+	return 2, nil // treat unknown/2.x as version 2
+}
+
+// wpsMajorVersion returns the cached major version for the given service URL,
+// or probes via GetCapabilities and caches the result.
+func (b *WPSBackend) wpsMajorVersion(ctx context.Context, service domain.ProcessingService) (int, error) {
+	if v, ok := b.versionCache.Load(service.URL); ok {
+		return v.(int), nil
+	}
+	// Probe with no version so any WPS server responds.
+	probeURL := service.URL + "?service=WPS&request=GetCapabilities"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
+	if err != nil {
+		return 0, fmt.Errorf("building WPS version probe: %w", err)
+	}
+	for k, v := range service.Headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("WPS version probe: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, fmt.Errorf("reading WPS version probe: %w", err)
+	}
+	major, err := wpsDetectMajorVersion(body)
+	if err != nil {
+		return 0, err
+	}
+	b.versionCache.Store(service.URL, major)
+	return major, nil
 }
 
 // FetchProcessList calls GetCapabilities and returns a ProcessSummary slice.
