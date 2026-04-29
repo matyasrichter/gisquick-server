@@ -700,19 +700,18 @@ func (b *WPSBackend) DescribeProcess(ctx context.Context, service domain.Process
 	}, nil
 }
 
-// Execute submits an execution request to a WPS 2.0.2 service, waits for
-// completion (polling for async, or parsing inline for sync), and returns the
-// output results together with the remote job ID.
+// Execute submits an execution request to a WPS service (version 1.0 or 2.0),
+// waits for completion (polling for async, or parsing inline for sync), and
+// returns the output results together with the remote job ID.
 func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage) ([]OutputResult, string, error) {
-	// ------------------------------------------------------------------
-	// Step 1: determine execution mode from stored process description.
-	// ------------------------------------------------------------------
+	// Determine execution mode from stored process description.
 	mode := "async" // default
+	var descJSON json.RawMessage
 	if pc, ok := service.Processes[job.ProcessID]; ok && len(pc.Description) > 0 {
+		descJSON = pc.Description
 		var desc ProcessDescription
-		if err := json.Unmarshal(pc.Description, &desc); err == nil {
-			hasAsync := false
-			hasSync := false
+		if err := json.Unmarshal(descJSON, &desc); err == nil {
+			hasAsync, hasSync := false, false
 			for _, opt := range desc.JobControlOptions {
 				switch opt {
 				case "async-execute":
@@ -727,17 +726,88 @@ func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain
 		}
 	}
 
-	// ------------------------------------------------------------------
-	// Step 2: translate OGC API JSON inputs → WPS Execute XML.
-	// ------------------------------------------------------------------
+	major, err := b.wpsMajorVersion(ctx, service)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if major == 1 {
+		return b.executeWPS1(ctx, job, service, inputs, mode, descJSON)
+	}
+	return b.executeWPS2(ctx, job, service, inputs, mode)
+}
+
+// executeWPS1 handles the WPS 1.0 Execute path: builds the XML request,
+// POSTs it, and either parses an inline result (sync/immediate success) or
+// polls the statusLocation URL until the job reaches a terminal state.
+func (b *WPSBackend) executeWPS1(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, mode string, descJSON json.RawMessage) ([]OutputResult, string, error) {
+	outputIDs := wps1OutputIDs(descJSON)
+
+	xmlBody, err := b.buildWPS1ExecuteXML(job.ProcessID, mode, inputs, outputIDs)
+	if err != nil {
+		return nil, "", fmt.Errorf("building WPS 1.0 Execute XML: %w", err)
+	}
+
+	executeURL := service.URL + "?service=WPS&version=1.0.0&request=Execute"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, executeURL, bytes.NewReader(xmlBody))
+	if err != nil {
+		return nil, "", fmt.Errorf("building WPS 1.0 Execute HTTP request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/xml")
+	for k, v := range service.Headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("sending WPS 1.0 Execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("WPS 1.0 Execute returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("reading WPS 1.0 Execute response: %w", err)
+	}
+
+	execResp, err := parseWPS1ExecuteResponse(body)
+	if err != nil {
+		return nil, "", err
+	}
+
+	statusLocation := execResp.StatusLocation
+
+	switch {
+	case execResp.Status.ProcessSucceeded != nil:
+		results, err := parseWPS1Result(execResp.ProcessOutputs)
+		return results, "", err
+	case execResp.Status.ProcessFailed != nil:
+		msg := execResp.Status.ProcessFailed.ExceptionReport.Exception.ExceptionText
+		if msg == "" {
+			msg = "unknown failure"
+		}
+		return nil, "", fmt.Errorf("WPS 1.0 Execute failed: %s", msg)
+	case statusLocation != "":
+		results, err := b.wps1PollAndFetch(ctx, service, statusLocation)
+		return results, statusLocation, err
+	default:
+		return nil, "", fmt.Errorf("WPS 1.0 ExecuteResponse has no statusLocation and no terminal status")
+	}
+}
+
+// executeWPS2 handles the WPS 2.0.2 Execute path: builds the XML request,
+// POSTs it, and either parses an inline Result (sync) or polls GetStatus until
+// the job succeeds or fails, then fetches GetResult.
+func (b *WPSBackend) executeWPS2(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, mode string) ([]OutputResult, string, error) {
 	xmlBody, err := b.buildExecuteXML(job.ProcessID, mode, inputs)
 	if err != nil {
 		return nil, "", fmt.Errorf("building WPS Execute XML: %w", err)
 	}
 
-	// ------------------------------------------------------------------
-	// Step 3: POST the Execute request.
-	// ------------------------------------------------------------------
 	executeURL := service.URL + "?service=WPS&version=2.0.0&request=Execute"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, executeURL, bytes.NewReader(xmlBody))
 	if err != nil {
@@ -759,33 +829,155 @@ func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain
 		return nil, "", fmt.Errorf("WPS Execute returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// ------------------------------------------------------------------
-	// Step 4/5: parse response body — async → poll; sync → parse inline.
-	// ------------------------------------------------------------------
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, "", fmt.Errorf("reading WPS Execute response body: %w", err)
 	}
 
-	// Detect which root element was returned regardless of requested mode.
 	rootName := wpsRootElementName(body)
 	switch rootName {
 	case "StatusInfo":
-		// Async path: parse the StatusInfo, then poll.
 		var si wpsStatusInfoResponse
 		if err := xml.Unmarshal(body, &si); err != nil {
 			return nil, "", fmt.Errorf("parsing WPS StatusInfo: %w", err)
 		}
 		results, err := b.wpsPollAndFetch(ctx, service, si.JobID)
 		return results, si.JobID, err
-
 	case "Result":
-		// Sync path: parse wps:Result inline.
 		results, err := b.parseWPSResult(body)
 		return results, "", err
-
 	default:
 		return nil, "", fmt.Errorf("unexpected WPS Execute response root element %q", rootName)
+	}
+}
+
+// wps1OutputIDs extracts output identifiers from a JSON-encoded ProcessDescription.
+func wps1OutputIDs(descJSON json.RawMessage) []string {
+	var desc ProcessDescription
+	if err := json.Unmarshal(descJSON, &desc); err != nil || len(desc.Outputs) == 0 {
+		return nil
+	}
+	var outputsMap map[string]any
+	if err := json.Unmarshal(desc.Outputs, &outputsMap); err != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(outputsMap))
+	for id := range outputsMap {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// parseWPS1ExecuteResponse parses a WPS 1.0 ExecuteResponse document.
+func parseWPS1ExecuteResponse(body []byte) (*wps1ExecuteResponse, error) {
+	var r wps1ExecuteResponse
+	if err := xml.Unmarshal(body, &r); err != nil {
+		return nil, fmt.Errorf("parsing WPS 1.0 ExecuteResponse: %w", err)
+	}
+	return &r, nil
+}
+
+// parseWPS1Result converts WPS 1.0 ProcessOutputs into []OutputResult.
+func parseWPS1Result(outputs wps1ProcessOutputsResult) ([]OutputResult, error) {
+	results := make([]OutputResult, 0, len(outputs.Outputs))
+	for _, out := range outputs.Outputs {
+		r, err := wps1OutputToResult(out)
+		if err != nil {
+			continue
+		}
+		results = append(results, r)
+	}
+	return results, nil
+}
+
+func wps1OutputToResult(out wps1OutputResult) (OutputResult, error) {
+	if out.Reference != nil && out.Reference.Href != "" {
+		return OutputResult{
+			OutputID:    out.Identifier.Value,
+			Reference:   out.Reference.Href,
+			ContentType: out.Reference.MimeType,
+		}, nil
+	}
+	if out.Data != nil {
+		if out.Data.LiteralData != nil {
+			return OutputResult{
+				OutputID:    out.Identifier.Value,
+				Value:       []byte(out.Data.LiteralData.Value),
+				ContentType: "text/plain",
+			}, nil
+		}
+		if out.Data.ComplexData != nil {
+			ct := out.Data.ComplexData.MimeType
+			if ct == "" {
+				ct = "application/octet-stream"
+			}
+			return OutputResult{
+				OutputID:    out.Identifier.Value,
+				Value:       []byte(out.Data.ComplexData.Value),
+				ContentType: ct,
+			}, nil
+		}
+	}
+	return OutputResult{}, fmt.Errorf("output %q has no data or reference", out.Identifier.Value)
+}
+
+// wps1PollAndFetch polls the statusLocation URL until the WPS 1.0 job completes.
+func (b *WPSBackend) wps1PollAndFetch(ctx context.Context, service domain.ProcessingService, statusLocation string) ([]OutputResult, error) {
+	interval := b.pollInterval
+	if interval == 0 {
+		interval = initialPollInterval
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusLocation, nil)
+		if err != nil {
+			return nil, fmt.Errorf("building WPS 1.0 status poll request: %w", err)
+		}
+		for k, v := range service.Headers {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := b.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("WPS 1.0 status poll: %w", err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("reading WPS 1.0 status response: %w", readErr)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("WPS 1.0 status poll returned status %d: %s", resp.StatusCode, string(body))
+		}
+
+		execResp, err := parseWPS1ExecuteResponse(body)
+		if err != nil {
+			return nil, err
+		}
+
+		b.log.Debugw("WPS 1.0 job poll", "statusLocation", statusLocation)
+
+		switch {
+		case execResp.Status.ProcessSucceeded != nil:
+			return parseWPS1Result(execResp.ProcessOutputs)
+		case execResp.Status.ProcessFailed != nil:
+			msg := execResp.Status.ProcessFailed.ExceptionReport.Exception.ExceptionText
+			if msg == "" {
+				msg = "unknown failure"
+			}
+			return nil, fmt.Errorf("WPS 1.0 job failed: %s", msg)
+		default:
+			interval *= 2
+			if interval > maxPollInterval {
+				interval = maxPollInterval
+			}
+		}
 	}
 }
 

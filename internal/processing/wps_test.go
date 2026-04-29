@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -219,6 +220,9 @@ func TestWPSExecuteAsync(t *testing.T) {
 	fakeWPS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
 		switch r.URL.Query().Get("request") {
+		case "GetCapabilities":
+			io.WriteString(w, `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/2.0" version="2.0.0" service="WPS"><wps:Contents></wps:Contents></wps:Capabilities>`)
+
 		case "Execute":
 			io.WriteString(w, `<?xml version="1.0"?>
 <wps:StatusInfo xmlns:wps="http://www.opengis.net/wps/2.0">
@@ -308,12 +312,12 @@ func TestWPSExecuteAsync(t *testing.T) {
 
 func TestWPSExecuteSync(t *testing.T) {
 	fakeWPS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("request") != "Execute" {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
 		w.Header().Set("Content-Type", "application/xml")
-		io.WriteString(w, `<?xml version="1.0"?>
+		switch r.URL.Query().Get("request") {
+		case "GetCapabilities":
+			io.WriteString(w, `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/2.0" version="2.0.0" service="WPS"><wps:Contents></wps:Contents></wps:Capabilities>`)
+		case "Execute":
+			io.WriteString(w, `<?xml version="1.0"?>
 <wps:Result xmlns:wps="http://www.opengis.net/wps/2.0">
   <wps:JobID>test-job-sync</wps:JobID>
   <wps:Output id="result">
@@ -322,6 +326,9 @@ func TestWPSExecuteSync(t *testing.T) {
     </wps:Data>
   </wps:Output>
 </wps:Result>`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
 	}))
 	defer fakeWPS.Close()
 
@@ -375,6 +382,8 @@ func TestWPSExecuteFailure(t *testing.T) {
 	fakeWPS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
 		switch r.URL.Query().Get("request") {
+		case "GetCapabilities":
+			io.WriteString(w, `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/2.0" version="2.0.0" service="WPS"><wps:Contents></wps:Contents></wps:Capabilities>`)
 		case "Execute":
 			io.WriteString(w, `<?xml version="1.0"?>
 <wps:StatusInfo xmlns:wps="http://www.opengis.net/wps/2.0">
@@ -661,4 +670,214 @@ func TestWPSDetectVersion(t *testing.T) {
 			assert.Equal(t, tc.wantMajor, got)
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Execute — WPS 1.0 async path
+// ---------------------------------------------------------------------------
+
+func TestWPS1ExecuteAsync(t *testing.T) {
+	capsXML := `<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
+      xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
+    <wps:ProcessOfferings>
+      <wps:Process><ows:Identifier>buffer</ows:Identifier><ows:Title>Buffer</ows:Title></wps:Process>
+    </wps:ProcessOfferings>
+  </wps:WPS_Capabilities>`
+
+	acceptedXML := `<wps:ExecuteResponse xmlns:wps="http://www.opengis.net/wps/1.0.0"
+      xmlns:ows="http://www.opengis.net/ows/1.1"
+      statusLocation="STATUS_LOCATION_URL" version="1.0.0" service="WPS">
+    <wps:Status><wps:ProcessAccepted>Job accepted</wps:ProcessAccepted></wps:Status>
+  </wps:ExecuteResponse>`
+
+	runningXML := `<wps:ExecuteResponse xmlns:wps="http://www.opengis.net/wps/1.0.0"
+      xmlns:ows="http://www.opengis.net/ows/1.1"
+      statusLocation="STATUS_LOCATION_URL" version="1.0.0" service="WPS">
+    <wps:Status><wps:ProcessStarted percentCompleted="50">Running</wps:ProcessStarted></wps:Status>
+  </wps:ExecuteResponse>`
+
+	succeededXML := `<wps:ExecuteResponse xmlns:wps="http://www.opengis.net/wps/1.0.0"
+      xmlns:ows="http://www.opengis.net/ows/1.1"
+      statusLocation="STATUS_LOCATION_URL" version="1.0.0" service="WPS">
+    <wps:Status><wps:ProcessSucceeded>Done</wps:ProcessSucceeded></wps:Status>
+    <wps:ProcessOutputs>
+      <wps:Output>
+        <ows:Identifier>result</ows:Identifier>
+        <wps:Data><wps:LiteralData>42.0</wps:LiteralData></wps:Data>
+      </wps:Output>
+    </wps:ProcessOutputs>
+  </wps:ExecuteResponse>`
+
+	pollCount := 0
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		reqParam := r.URL.Query().Get("request")
+		if reqParam == "GetCapabilities" {
+			fmt.Fprint(w, capsXML)
+			return
+		}
+		if reqParam == "Execute" {
+			body := strings.Replace(acceptedXML, "STATUS_LOCATION_URL", srv.URL+"?request=status", 1)
+			fmt.Fprint(w, body)
+			return
+		}
+		// Status polling
+		pollCount++
+		switch pollCount {
+		case 1:
+			fmt.Fprint(w, strings.Replace(runningXML, "STATUS_LOCATION_URL", srv.URL+"?request=status", 1))
+		default:
+			fmt.Fprint(w, strings.Replace(succeededXML, "STATUS_LOCATION_URL", srv.URL+"?request=status", 1))
+		}
+	}))
+	defer srv.Close()
+
+	backend := &WPSBackend{
+		client:       srv.Client(),
+		log:          zap.NewNop().Sugar(),
+		pollInterval: time.Millisecond,
+	}
+	descJSON, _ := json.Marshal(ProcessDescription{
+		JobControlOptions: []string{"async-execute", "sync-execute"},
+		Outputs:           json.RawMessage(`{"result":{"title":"Result","schema":{"type":"string"}}}`),
+	})
+	service := domain.ProcessingService{
+		URL: srv.URL,
+		Processes: map[string]domain.ProcessConfig{
+			"buffer": {Description: descJSON},
+		},
+	}
+
+	job := &JobRecord{ProcessID: "buffer"}
+	inputs := json.RawMessage(`{"inputs":{"distance":10.0}}`)
+
+	results, remoteID, err := backend.Execute(context.Background(), job, service, inputs)
+	require.NoError(t, err)
+	assert.NotEmpty(t, remoteID) // statusLocation URL
+	require.Len(t, results, 1)
+	assert.Equal(t, "result", results[0].OutputID)
+	assert.Equal(t, []byte("42.0"), results[0].Value)
+}
+
+// ---------------------------------------------------------------------------
+// Execute — WPS 1.0 sync path
+// ---------------------------------------------------------------------------
+
+func TestWPS1ExecuteSync(t *testing.T) {
+	capsXML := `<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
+      xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
+    <wps:ProcessOfferings>
+      <wps:Process><ows:Identifier>info</ows:Identifier><ows:Title>Info</ows:Title></wps:Process>
+    </wps:ProcessOfferings>
+  </wps:WPS_Capabilities>`
+
+	syncResultXML := `<wps:ExecuteResponse xmlns:wps="http://www.opengis.net/wps/1.0.0"
+      xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
+    <wps:Status><wps:ProcessSucceeded>Done</wps:ProcessSucceeded></wps:Status>
+    <wps:ProcessOutputs>
+      <wps:Output>
+        <ows:Identifier>out</ows:Identifier>
+        <wps:Data><wps:LiteralData>hello</wps:LiteralData></wps:Data>
+      </wps:Output>
+    </wps:ProcessOutputs>
+  </wps:ExecuteResponse>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		if r.URL.Query().Get("request") == "GetCapabilities" {
+			fmt.Fprint(w, capsXML)
+			return
+		}
+		fmt.Fprint(w, syncResultXML)
+	}))
+	defer srv.Close()
+
+	backend := &WPSBackend{
+		client:       srv.Client(),
+		log:          zap.NewNop().Sugar(),
+		pollInterval: time.Millisecond,
+	}
+	descJSON, _ := json.Marshal(ProcessDescription{
+		JobControlOptions: []string{"sync-execute"},
+		Outputs:           json.RawMessage(`{"out":{"title":"Out","schema":{"type":"string"}}}`),
+	})
+	service := domain.ProcessingService{
+		URL: srv.URL,
+		Processes: map[string]domain.ProcessConfig{
+			"info": {Description: descJSON},
+		},
+	}
+
+	job := &JobRecord{ProcessID: "info"}
+	inputs := json.RawMessage(`{"inputs":{}}`)
+	results, remoteID, err := backend.Execute(context.Background(), job, service, inputs)
+	require.NoError(t, err)
+	assert.Empty(t, remoteID)
+	require.Len(t, results, 1)
+	assert.Equal(t, "out", results[0].OutputID)
+}
+
+// ---------------------------------------------------------------------------
+// Execute — WPS 1.0 failure path
+// ---------------------------------------------------------------------------
+
+func TestWPS1ExecuteFailure(t *testing.T) {
+	capsXML := `<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
+      xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
+    <wps:ProcessOfferings>
+      <wps:Process><ows:Identifier>proc</ows:Identifier><ows:Title>P</ows:Title></wps:Process>
+    </wps:ProcessOfferings>
+  </wps:WPS_Capabilities>`
+
+	acceptedXML := `<wps:ExecuteResponse xmlns:wps="http://www.opengis.net/wps/1.0.0"
+      xmlns:ows="http://www.opengis.net/ows/1.1" statusLocation="STATUS_LOCATION_URL">
+    <wps:Status><wps:ProcessAccepted>Accepted</wps:ProcessAccepted></wps:Status>
+  </wps:ExecuteResponse>`
+
+	failedXML := `<wps:ExecuteResponse xmlns:wps="http://www.opengis.net/wps/1.0.0"
+      xmlns:ows="http://www.opengis.net/ows/1.1" statusLocation="STATUS_LOCATION_URL">
+    <wps:Status>
+      <wps:ProcessFailed>
+        <ows:ExceptionReport xmlns:ows="http://www.opengis.net/ows/1.1">
+          <ows:Exception><ows:ExceptionText>out of memory</ows:ExceptionText></ows:Exception>
+        </ows:ExceptionReport>
+      </wps:ProcessFailed>
+    </wps:Status>
+  </wps:ExecuteResponse>`
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		if r.URL.Query().Get("request") == "GetCapabilities" {
+			fmt.Fprint(w, capsXML)
+			return
+		}
+		if r.URL.Query().Get("request") == "Execute" {
+			fmt.Fprint(w, strings.Replace(acceptedXML, "STATUS_LOCATION_URL", srv.URL+"?request=status", 1))
+			return
+		}
+		fmt.Fprint(w, strings.Replace(failedXML, "STATUS_LOCATION_URL", srv.URL+"?request=status", 1))
+	}))
+	defer srv.Close()
+
+	backend := &WPSBackend{
+		client:       srv.Client(),
+		log:          zap.NewNop().Sugar(),
+		pollInterval: time.Millisecond,
+	}
+	descJSON, _ := json.Marshal(ProcessDescription{
+		JobControlOptions: []string{"async-execute"},
+		Outputs:           json.RawMessage(`{"out":{"title":"Out","schema":{"type":"string"}}}`),
+	})
+	service := domain.ProcessingService{
+		URL: srv.URL,
+		Processes: map[string]domain.ProcessConfig{
+			"proc": {Description: descJSON},
+		},
+	}
+
+	_, _, err := backend.Execute(context.Background(), &JobRecord{ProcessID: "proc"}, service, json.RawMessage(`{"inputs":{}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "out of memory")
 }
