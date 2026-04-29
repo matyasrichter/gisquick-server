@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/gisquick/gisquick-server/internal/domain"
+	"go.uber.org/zap"
 )
 
 // ProcessDescription holds the structured fields of an OGC API – Processes
@@ -49,8 +50,7 @@ func NewBackend(service domain.ProcessingService, httpClient *http.Client) Proce
 		client := &OGCAPIClient{httpClient: httpClient}
 		return &OGCAPIBackend{client: client}
 	case domain.ProcessingServiceTypeWPS:
-		// WPS backend — to be implemented in the next task.
-		return &WPSBackend{}
+		return &WPSBackend{client: httpClient, log: zap.NewNop().Sugar()}
 	default:
 		return nil
 	}
