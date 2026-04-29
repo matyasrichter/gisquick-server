@@ -280,6 +280,75 @@ func marshalOutputValue(raw json.RawMessage) ([]byte, error) {
 	return []byte(raw), nil
 }
 
+// OGCAPIBackend implements ProcessingBackend for OGC API – Processes services.
+// It delegates all HTTP communication to an OGCAPIClient.
+type OGCAPIBackend struct {
+	client *OGCAPIClient
+}
+
+// FetchProcessList retrieves the process list from the remote OGC API endpoint.
+func (b *OGCAPIBackend) FetchProcessList(ctx context.Context, service domain.ProcessingService) ([]ProcessSummary, error) {
+	base := strings.TrimRight(service.URL, "/")
+	fwdHeaders := toHTTPHeader(service.Headers)
+
+	resp, err := b.client.ForwardRequest(http.MethodGet, base+"/processes", nil, fwdHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("fetching process list: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("process list returned status %d", resp.StatusCode)
+	}
+
+	var list ProcessList
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("decoding process list: %w", err)
+	}
+	return list.Processes, nil
+}
+
+// DescribeProcess fetches the full description of a single process from the
+// remote OGC API endpoint.
+func (b *OGCAPIBackend) DescribeProcess(ctx context.Context, service domain.ProcessingService, processID string) (*ProcessDescription, error) {
+	base := strings.TrimRight(service.URL, "/")
+	fwdHeaders := toHTTPHeader(service.Headers)
+
+	resp, err := b.client.ForwardRequest(http.MethodGet, base+"/processes/"+processID, nil, fwdHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("fetching process description for %q: %w", processID, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("process description for %q returned status %d", processID, resp.StatusCode)
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading process description for %q: %w", processID, err)
+	}
+
+	var desc ProcessDescription
+	if err := json.Unmarshal(raw, &desc); err != nil {
+		return nil, fmt.Errorf("parsing process description for %q: %w", processID, err)
+	}
+	desc.Raw = json.RawMessage(raw)
+	return &desc, nil
+}
+
+// Execute submits a job to the remote OGC API – Processes endpoint and waits
+// for it to complete. It returns the output results and the remote job ID.
+// The job parameter is present for interface compatibility; the backend does
+// not mutate it — mutation is the caller's responsibility.
+func (b *OGCAPIBackend) Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage) ([]OutputResult, string, error) {
+	remote := domain.RemoteConfig{
+		ExecuteURL: strings.TrimRight(service.URL, "/") + "/processes/" + job.ProcessID + "/execution",
+		Type:       string(service.Type),
+		Headers:    service.Headers,
+	}
+	remoteJobID, results, err := b.client.Execute(ctx, remote, []byte(inputs))
+	return results, remoteJobID, err
+}
+
 // findResultsURL looks for the results link in an OGC status response.
 func (c *OGCAPIClient) findResultsURL(links []Link) string {
 	// Prefer a results link that explicitly asks for JSON.
