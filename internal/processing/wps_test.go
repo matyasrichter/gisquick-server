@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gisquick/gisquick-server/internal/domain"
 	"go.uber.org/zap"
@@ -264,6 +265,7 @@ func TestWPSExecuteAsync(t *testing.T) {
 
 	log := zap.NewNop().Sugar()
 	backend := NewBackend(svc, fakeWPS.Client(), log)
+	backend.(*WPSBackend).pollInterval = time.Millisecond
 
 	job := &JobRecord{
 		JobID:     "local-job-123",
@@ -287,6 +289,9 @@ func TestWPSExecuteAsync(t *testing.T) {
 	}
 	if string(results[0].Value) != "42.0" {
 		t.Errorf("expected value '42.0', got %q", string(results[0].Value))
+	}
+	if results[0].ContentType != "text/plain" {
+		t.Errorf("expected ContentType 'text/plain', got %q", results[0].ContentType)
 	}
 }
 
@@ -350,6 +355,9 @@ func TestWPSExecuteSync(t *testing.T) {
 	if string(results[0].Value) != "42.0" {
 		t.Errorf("expected value '42.0', got %q", string(results[0].Value))
 	}
+	if results[0].ContentType != "text/plain" {
+		t.Errorf("expected ContentType 'text/plain', got %q", results[0].ContentType)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +398,7 @@ func TestWPSExecuteFailure(t *testing.T) {
 
 	log := zap.NewNop().Sugar()
 	backend := NewBackend(svc, fakeWPS.Client(), log)
+	backend.(*WPSBackend).pollInterval = time.Millisecond
 
 	job := &JobRecord{
 		JobID:     "local-job-fail",

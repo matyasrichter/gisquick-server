@@ -116,8 +116,9 @@ type wpsBoundingBoxData struct{}
 
 // WPSBackend implements ProcessingBackend for OGC WPS 2.0.2 services.
 type WPSBackend struct {
-	client *http.Client
-	log    *zap.SugaredLogger
+	client       *http.Client
+	log          *zap.SugaredLogger
+	pollInterval time.Duration // overridable in tests; zero → use initialPollInterval
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +603,10 @@ func wpsRootElementName(buf []byte) string {
 // wpsPollAndFetch polls GetStatus until the job succeeds or fails, then calls
 // GetResult and parses the output.
 func (b *WPSBackend) wpsPollAndFetch(ctx context.Context, service domain.ProcessingService, jobID string) ([]OutputResult, error) {
-	interval := initialPollInterval
+	interval := b.pollInterval
+	if interval == 0 {
+		interval = initialPollInterval
+	}
 
 	for {
 		select {
