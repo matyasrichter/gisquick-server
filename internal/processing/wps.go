@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gisquick/gisquick-server/internal/domain"
@@ -84,8 +85,11 @@ type wpsOutput struct {
 
 type wpsLiteralData struct {
 	AllowedValues owsAllowedValues `xml:"http://www.opengis.net/ows/1.1 AllowedValues"`
-	DataType      string           `xml:"http://www.opengis.net/ows/1.1 DataType"`
-	Default       string           `xml:"default,attr"`
+	DataType      struct {
+		Value     string `xml:",chardata"`
+		Reference string `xml:"reference,attr"`
+	} `xml:"http://www.opengis.net/ows/1.1 DataType"`
+	Default string `xml:"default,attr"`
 }
 
 type owsAllowedValues struct {
@@ -118,7 +122,7 @@ type WPSBackend struct {
 func wpsQueryURL(base, request, identifier string) string {
 	u := base + "?service=WPS&version=2.0.0&request=" + request
 	if identifier != "" {
-		u += "&identifier=" + identifier
+		u += "&identifier=" + url.QueryEscape(identifier)
 	}
 	return u
 }
@@ -325,7 +329,7 @@ func bboxSchema() map[string]any {
 		"format":   "bbox",
 		"items":    map[string]any{"type": "number"},
 		"minItems": 4,
-		"maxItems": 4,
+		"maxItems": 6,
 	}
 }
 
@@ -340,7 +344,12 @@ func complexDataSchema(cd *wpsComplexData) map[string]any {
 }
 
 func literalDataSchema(ld *wpsLiteralData) map[string]any {
-	schema := map[string]any{"type": literalDataType(ld.DataType)}
+	// Prefer the reference attribute (URI like xs:double) over text content.
+	dt := ld.DataType.Reference
+	if dt == "" {
+		dt = ld.DataType.Value
+	}
+	schema := map[string]any{"type": literalDataType(dt)}
 
 	if len(ld.AllowedValues.Values) > 0 {
 		enum := make([]any, len(ld.AllowedValues.Values))
@@ -353,7 +362,13 @@ func literalDataSchema(ld *wpsLiteralData) map[string]any {
 }
 
 // literalDataType maps a WPS DataType string to an OGC API JSON Schema type.
+// The input may be a bare name ("double"), an xs:-prefixed name ("xs:double"),
+// or a full URI ("http://www.w3.org/2001/XMLSchema#double").
 func literalDataType(dt string) string {
+	// Strip namespace prefix or URI path to get the local name.
+	if i := strings.LastIndexAny(dt, ":#/"); i >= 0 {
+		dt = dt[i+1:]
+	}
 	switch strings.ToLower(dt) {
 	case "float", "double", "decimal":
 		return "number"
