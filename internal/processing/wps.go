@@ -1,6 +1,7 @@
 package processing
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gisquick/gisquick-server/internal/domain"
 	"go.uber.org/zap"
@@ -118,6 +120,102 @@ type WPSBackend struct {
 	log    *zap.SugaredLogger
 }
 
+// ---------------------------------------------------------------------------
+// WPS 2.0.2 XML structs — Execute request
+// ---------------------------------------------------------------------------
+
+type wpsExecuteRequest struct {
+	XMLName    xml.Name           `xml:"wps:Execute"`
+	WPSNs      string             `xml:"xmlns:wps,attr"`
+	OWSNs      string             `xml:"xmlns:ows,attr"`
+	Service    string             `xml:"service,attr"`
+	Version    string             `xml:"version,attr"`
+	Mode       string             `xml:"mode,attr"`
+	Response   string             `xml:"response,attr"`
+	Identifier wpsExecIdentifier  `xml:"ows:Identifier"`
+	Inputs     []wpsInputElement  `xml:"wps:Input"`
+	Outputs    []wpsOutputRequest `xml:"wps:Output"`
+}
+
+type wpsExecIdentifier struct {
+	Value string `xml:",chardata"`
+}
+
+type wpsInputElement struct {
+	ID   string      `xml:"id,attr"`
+	Data wpsDataElem `xml:"wps:Data"`
+}
+
+type wpsDataElem struct {
+	LiteralData  *wpsExecLiteralData  `xml:"wps:LiteralData"`
+	ComplexData  *wpsExecComplexData  `xml:"wps:ComplexData"`
+	BoundingBox  *wpsExecBoundingBox  `xml:"wps:BoundingBoxData"`
+}
+
+type wpsExecLiteralData struct {
+	Value string `xml:",chardata"`
+}
+
+type wpsExecComplexData struct {
+	MimeType string `xml:"mimeType,attr"`
+	Value    string `xml:",chardata"`
+}
+
+type wpsExecBoundingBox struct {
+	CRS        string `xml:"crs,attr"`
+	LowerCorner string `xml:"ows:LowerCorner"`
+	UpperCorner string `xml:"ows:UpperCorner"`
+}
+
+type wpsOutputRequest struct {
+	ID           string `xml:"id,attr"`
+	Transmission string `xml:"transmission,attr"`
+}
+
+// ---------------------------------------------------------------------------
+// WPS 2.0.2 XML structs — StatusInfo and Result responses
+// ---------------------------------------------------------------------------
+
+type wpsStatusInfoResponse struct {
+	XMLName xml.Name `xml:"http://www.opengis.net/wps/2.0 StatusInfo"`
+	JobID   string   `xml:"http://www.opengis.net/wps/2.0 JobID"`
+	Status  string   `xml:"http://www.opengis.net/wps/2.0 Status"`
+}
+
+type wpsResultResponse struct {
+	XMLName xml.Name           `xml:"http://www.opengis.net/wps/2.0 Result"`
+	JobID   string             `xml:"http://www.opengis.net/wps/2.0 JobID"`
+	Outputs []wpsOutputElement `xml:"http://www.opengis.net/wps/2.0 Output"`
+}
+
+type wpsOutputElement struct {
+	ID        string       `xml:"id,attr"`
+	Data      *wpsDataOut  `xml:"http://www.opengis.net/wps/2.0 Data"`
+	Reference *wpsRefOut   `xml:"http://www.opengis.net/wps/2.0 Reference"`
+}
+
+type wpsDataOut struct {
+	LiteralData *wpsLiteralDataOut  `xml:"http://www.opengis.net/wps/2.0 LiteralData"`
+	ComplexData *wpsComplexDataOut  `xml:"http://www.opengis.net/wps/2.0 ComplexData"`
+}
+
+type wpsLiteralDataOut struct {
+	Value string `xml:",chardata"`
+}
+
+type wpsComplexDataOut struct {
+	MimeType string `xml:"mimeType,attr"`
+	Value    string `xml:",chardata"`
+}
+
+type wpsRefOut struct {
+	Href string `xml:"href,attr"`
+}
+
+// ---------------------------------------------------------------------------
+// URL helpers
+// ---------------------------------------------------------------------------
+
 // wpsQueryURL constructs a WPS 2.0.0 KVP request URL.
 func wpsQueryURL(base, request, identifier string) string {
 	u := base + "?service=WPS&version=2.0.0&request=" + request
@@ -125,6 +223,12 @@ func wpsQueryURL(base, request, identifier string) string {
 		u += "&identifier=" + url.QueryEscape(identifier)
 	}
 	return u
+}
+
+// wpsJobURL constructs a WPS 2.0.0 KVP URL for job-scoped operations
+// (GetStatus, GetResult) that use a jobId parameter instead of identifier.
+func wpsJobURL(base, request, jobID string) string {
+	return base + "?service=WPS&version=2.0.0&request=" + request + "&jobId=" + url.QueryEscape(jobID)
 }
 
 // FetchProcessList calls GetCapabilities and returns a ProcessSummary slice.
@@ -261,9 +365,367 @@ func (b *WPSBackend) DescribeProcess(ctx context.Context, service domain.Process
 	}, nil
 }
 
-// Execute is a stub — Task C handles WPS execution.
-func (b *WPSBackend) Execute(_ context.Context, _ *JobRecord, _ domain.ProcessingService, _ json.RawMessage) ([]OutputResult, string, error) {
-	return nil, "", fmt.Errorf("WPS execute not yet implemented")
+// Execute submits an execution request to a WPS 2.0.2 service, waits for
+// completion (polling for async, or parsing inline for sync), and returns the
+// output results together with the remote job ID.
+func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage) ([]OutputResult, string, error) {
+	// ------------------------------------------------------------------
+	// Step 1: determine execution mode from stored process description.
+	// ------------------------------------------------------------------
+	mode := "async" // default
+	if pc, ok := service.Processes[job.ProcessID]; ok && len(pc.Description) > 0 {
+		var desc ProcessDescription
+		if err := json.Unmarshal(pc.Description, &desc); err == nil {
+			hasAsync := false
+			hasSync := false
+			for _, opt := range desc.JobControlOptions {
+				switch opt {
+				case "async-execute":
+					hasAsync = true
+				case "sync-execute":
+					hasSync = true
+				}
+			}
+			if hasSync && !hasAsync {
+				mode = "sync"
+			}
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// Step 2: translate OGC API JSON inputs → WPS Execute XML.
+	// ------------------------------------------------------------------
+	xmlBody, err := b.buildExecuteXML(job.ProcessID, mode, inputs)
+	if err != nil {
+		return nil, "", fmt.Errorf("building WPS Execute XML: %w", err)
+	}
+
+	// ------------------------------------------------------------------
+	// Step 3: POST the Execute request.
+	// ------------------------------------------------------------------
+	executeURL := service.URL + "?service=WPS&version=2.0.0&request=Execute"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, executeURL, bytes.NewReader(xmlBody))
+	if err != nil {
+		return nil, "", fmt.Errorf("building WPS Execute HTTP request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/xml")
+	for k, v := range service.Headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("sending WPS Execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("WPS Execute returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// ------------------------------------------------------------------
+	// Step 4/5: parse response body — async → poll; sync → parse inline.
+	// ------------------------------------------------------------------
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("reading WPS Execute response body: %w", err)
+	}
+
+	// Detect which root element was returned regardless of requested mode.
+	rootName := wpsRootElementName(body)
+	switch rootName {
+	case "StatusInfo":
+		// Async path: parse the StatusInfo, then poll.
+		var si wpsStatusInfoResponse
+		if err := xml.Unmarshal(body, &si); err != nil {
+			return nil, "", fmt.Errorf("parsing WPS StatusInfo: %w", err)
+		}
+		results, err := b.wpsPollandFetch(ctx, service, si.JobID)
+		return results, si.JobID, err
+
+	case "Result":
+		// Sync path: parse wps:Result inline.
+		results, err := b.parseWPSResult(body)
+		return results, "", err
+
+	default:
+		return nil, "", fmt.Errorf("unexpected WPS Execute response root element %q", rootName)
+	}
+}
+
+// buildExecuteXML marshals a WPS 2.0.2 Execute request body from the OGC API
+// JSON inputs document.
+func (b *WPSBackend) buildExecuteXML(processID, mode string, inputs json.RawMessage) ([]byte, error) {
+	// Parse the OGC API inputs map.
+	var wrapper struct {
+		Inputs map[string]json.RawMessage `json:"inputs"`
+	}
+	if err := json.Unmarshal(inputs, &wrapper); err != nil {
+		return nil, fmt.Errorf("parsing inputs JSON: %w", err)
+	}
+
+	// Translate each input.
+	var inputElems []wpsInputElement
+	for id, rawVal := range wrapper.Inputs {
+		elem, err := buildWPSInputElement(id, rawVal)
+		if err != nil {
+			return nil, fmt.Errorf("translating input %q: %w", id, err)
+		}
+		inputElems = append(inputElems, elem)
+	}
+
+	exec := wpsExecuteRequest{
+		WPSNs:   "http://www.opengis.net/wps/2.0",
+		OWSNs:   "http://www.opengis.net/ows/1.1",
+		Service:  "WPS",
+		Version:  "2.0.0",
+		Mode:     mode,
+		Response: "document",
+		Identifier: wpsExecIdentifier{Value: processID},
+		Inputs:   inputElems,
+		Outputs:  []wpsOutputRequest{{ID: "*", Transmission: "value"}},
+	}
+
+	out, err := xml.MarshalIndent(exec, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(xml.Header), out...), nil
+}
+
+// buildWPSInputElement converts a single OGC API JSON input value to a
+// wpsInputElement for XML marshaling.
+func buildWPSInputElement(id string, raw json.RawMessage) (wpsInputElement, error) {
+	// Determine the JSON value kind.
+	var val any
+	if err := json.Unmarshal(raw, &val); err != nil {
+		return wpsInputElement{}, fmt.Errorf("parsing value: %w", err)
+	}
+
+	elem := wpsInputElement{ID: id}
+
+	switch v := val.(type) {
+	case map[string]any:
+		// JSON object → ComplexData (GeoJSON)
+		elem.Data = wpsDataElem{
+			ComplexData: &wpsExecComplexData{
+				MimeType: "application/geo+json",
+				Value:    string(raw),
+			},
+		}
+
+	case []any:
+		// JSON array: bounding box if 4–6 numbers, otherwise ComplexData.
+		if isBBoxArray(v) {
+			nums := make([]float64, len(v))
+			for i, n := range v {
+				nums[i] = n.(float64)
+			}
+			lower := fmt.Sprintf("%g %g", nums[0], nums[1])
+			upper := fmt.Sprintf("%g %g", nums[2], nums[3])
+			elem.Data = wpsDataElem{
+				BoundingBox: &wpsExecBoundingBox{
+					CRS:         "EPSG:4326",
+					LowerCorner: lower,
+					UpperCorner: upper,
+				},
+			}
+		} else {
+			elem.Data = wpsDataElem{
+				ComplexData: &wpsExecComplexData{
+					MimeType: "application/json",
+					Value:    string(raw),
+				},
+			}
+		}
+
+	default:
+		// Scalar (string, number, boolean) → LiteralData.
+		var s string
+		switch tv := v.(type) {
+		case string:
+			s = tv
+		case float64:
+			s = fmt.Sprintf("%g", tv)
+		case bool:
+			if tv {
+				s = "true"
+			} else {
+				s = "false"
+			}
+		default:
+			s = string(raw)
+		}
+		elem.Data = wpsDataElem{
+			LiteralData: &wpsExecLiteralData{Value: s},
+		}
+	}
+
+	return elem, nil
+}
+
+// isBBoxArray returns true when v is a JSON array of 4–6 float64 numbers.
+func isBBoxArray(v []any) bool {
+	if len(v) < 4 || len(v) > 6 {
+		return false
+	}
+	for _, item := range v {
+		if _, ok := item.(float64); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// wpsRootElementName returns the local name of the root XML element of buf.
+func wpsRootElementName(buf []byte) string {
+	dec := xml.NewDecoder(bytes.NewReader(buf))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if se, ok := tok.(xml.StartElement); ok {
+			return se.Name.Local
+		}
+	}
+}
+
+// wpsPollandFetch polls GetStatus until the job succeeds or fails, then calls
+// GetResult and parses the output.
+func (b *WPSBackend) wpsPollandFetch(ctx context.Context, service domain.ProcessingService, jobID string) ([]OutputResult, error) {
+	interval := initialPollInterval
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(interval):
+		}
+
+		statusURL := wpsJobURL(service.URL, "GetStatus", jobID)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("building GetStatus request: %w", err)
+		}
+		for k, v := range service.Headers {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := b.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("WPS GetStatus: %w", err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("reading GetStatus body: %w", readErr)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("WPS GetStatus returned status %d: %s", resp.StatusCode, string(body))
+		}
+
+		var si wpsStatusInfoResponse
+		if err := xml.Unmarshal(body, &si); err != nil {
+			return nil, fmt.Errorf("parsing WPS StatusInfo: %w", err)
+		}
+
+		b.log.Debugw("WPS job poll", "jobID", jobID, "status", si.Status)
+
+		switch si.Status {
+		case "Succeeded":
+			return b.wpsGetResult(ctx, service, jobID)
+		case "Failed", "Dismissed":
+			return nil, fmt.Errorf("WPS job %s: status=%s", jobID, si.Status)
+		default:
+			// Accepted / Running — backoff and retry.
+			interval *= 2
+			if interval > maxPollInterval {
+				interval = maxPollInterval
+			}
+		}
+	}
+}
+
+// wpsGetResult calls GetResult and parses the wps:Result body.
+func (b *WPSBackend) wpsGetResult(ctx context.Context, service domain.ProcessingService, jobID string) ([]OutputResult, error) {
+	resultURL := wpsJobURL(service.URL, "GetResult", jobID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, resultURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building GetResult request: %w", err)
+	}
+	for k, v := range service.Headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("WPS GetResult: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading GetResult body: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("WPS GetResult returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return b.parseWPSResult(body)
+}
+
+// parseWPSResult parses a wps:Result document into a slice of OutputResult.
+func (b *WPSBackend) parseWPSResult(body []byte) ([]OutputResult, error) {
+	var result wpsResultResponse
+	if err := xml.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parsing WPS Result XML: %w", err)
+	}
+
+	outputs := make([]OutputResult, 0, len(result.Outputs))
+	for _, out := range result.Outputs {
+		r, err := wpsOutputToResult(out)
+		if err != nil {
+			b.log.Warnw("skipping unparseable WPS output", "id", out.ID, zap.Error(err))
+			continue
+		}
+		outputs = append(outputs, r)
+	}
+	return outputs, nil
+}
+
+// wpsOutputToResult converts a parsed wpsOutputElement to an OutputResult.
+func wpsOutputToResult(out wpsOutputElement) (OutputResult, error) {
+	if out.Reference != nil && out.Reference.Href != "" {
+		return OutputResult{
+			OutputID:  out.ID,
+			Reference: out.Reference.Href,
+		}, nil
+	}
+
+	if out.Data != nil {
+		if out.Data.LiteralData != nil {
+			return OutputResult{
+				OutputID:    out.ID,
+				Value:       []byte(out.Data.LiteralData.Value),
+				ContentType: "text/plain",
+			}, nil
+		}
+		if out.Data.ComplexData != nil {
+			ct := out.Data.ComplexData.MimeType
+			if ct == "" {
+				ct = "application/octet-stream"
+			}
+			return OutputResult{
+				OutputID:    out.ID,
+				Value:       []byte(out.Data.ComplexData.Value),
+				ContentType: ct,
+			}, nil
+		}
+	}
+
+	return OutputResult{}, fmt.Errorf("output %q has no data or reference", out.ID)
 }
 
 // ---------------------------------------------------------------------------
