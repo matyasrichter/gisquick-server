@@ -289,9 +289,15 @@ type OGCAPIBackend struct {
 // FetchProcessList retrieves the process list from the remote OGC API endpoint.
 func (b *OGCAPIBackend) FetchProcessList(ctx context.Context, service domain.ProcessingService) ([]ProcessSummary, error) {
 	base := strings.TrimRight(service.URL, "/")
-	fwdHeaders := toHTTPHeader(service.Headers)
 
-	resp, err := b.client.ForwardRequest(http.MethodGet, base+"/processes", nil, fwdHeaders)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/processes", nil)
+	if err != nil {
+		return nil, fmt.Errorf("building process list request: %w", err)
+	}
+	for k, v := range service.Headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := b.client.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching process list: %w", err)
 	}
@@ -311,9 +317,15 @@ func (b *OGCAPIBackend) FetchProcessList(ctx context.Context, service domain.Pro
 // remote OGC API endpoint.
 func (b *OGCAPIBackend) DescribeProcess(ctx context.Context, service domain.ProcessingService, processID string) (*ProcessDescription, error) {
 	base := strings.TrimRight(service.URL, "/")
-	fwdHeaders := toHTTPHeader(service.Headers)
 
-	resp, err := b.client.ForwardRequest(http.MethodGet, base+"/processes/"+processID, nil, fwdHeaders)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/processes/"+processID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building describe request for %q: %w", processID, err)
+	}
+	for k, v := range service.Headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := b.client.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching process description for %q: %w", processID, err)
 	}
