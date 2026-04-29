@@ -43,14 +43,13 @@ type ProcessingBackend interface {
 // NewBackend returns the appropriate ProcessingBackend implementation for the
 // given service type. Returns nil for unknown service types — callers must
 // guard against a nil return.
-func NewBackend(service domain.ProcessingService, httpClient *http.Client) ProcessingBackend {
+func NewBackend(service domain.ProcessingService, httpClient *http.Client, log *zap.SugaredLogger) ProcessingBackend {
 	switch service.Type {
 	case domain.ProcessingServiceTypeOGCProcesses:
-		// TODO: accept a logger; for now the OGCAPIBackend carries its own client.
-		client := &OGCAPIClient{httpClient: httpClient}
+		client := &OGCAPIClient{httpClient: httpClient, log: log}
 		return &OGCAPIBackend{client: client}
 	case domain.ProcessingServiceTypeWPS:
-		return &WPSBackend{client: httpClient, log: zap.NewNop().Sugar()}
+		return &WPSBackend{client: httpClient, log: log}
 	default:
 		return nil
 	}

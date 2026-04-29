@@ -441,7 +441,7 @@ func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain
 		if err := xml.Unmarshal(body, &si); err != nil {
 			return nil, "", fmt.Errorf("parsing WPS StatusInfo: %w", err)
 		}
-		results, err := b.wpsPollandFetch(ctx, service, si.JobID)
+		results, err := b.wpsPollAndFetch(ctx, service, si.JobID)
 		return results, si.JobID, err
 
 	case "Result":
@@ -484,7 +484,7 @@ func (b *WPSBackend) buildExecuteXML(processID, mode string, inputs json.RawMess
 		Response: "document",
 		Identifier: wpsExecIdentifier{Value: processID},
 		Inputs:   inputElems,
-		Outputs:  []wpsOutputRequest{{ID: "*", Transmission: "value"}},
+		// Omit Outputs to request all outputs; WPS servers return everything by default.
 	}
 
 	out, err := xml.MarshalIndent(exec, "", "  ")
@@ -522,8 +522,15 @@ func buildWPSInputElement(id string, raw json.RawMessage) (wpsInputElement, erro
 			for i, n := range v {
 				nums[i] = n.(float64)
 			}
-			lower := fmt.Sprintf("%g %g", nums[0], nums[1])
-			upper := fmt.Sprintf("%g %g", nums[2], nums[3])
+			half := len(nums) / 2
+			lowerParts := make([]string, half)
+			upperParts := make([]string, half)
+			for i := 0; i < half; i++ {
+				lowerParts[i] = fmt.Sprintf("%g", nums[i])
+				upperParts[i] = fmt.Sprintf("%g", nums[half+i])
+			}
+			lower := strings.Join(lowerParts, " ")
+			upper := strings.Join(upperParts, " ")
 			elem.Data = wpsDataElem{
 				BoundingBox: &wpsExecBoundingBox{
 					CRS:         "EPSG:4326",
@@ -592,9 +599,9 @@ func wpsRootElementName(buf []byte) string {
 	}
 }
 
-// wpsPollandFetch polls GetStatus until the job succeeds or fails, then calls
+// wpsPollAndFetch polls GetStatus until the job succeeds or fails, then calls
 // GetResult and parses the output.
-func (b *WPSBackend) wpsPollandFetch(ctx context.Context, service domain.ProcessingService, jobID string) ([]OutputResult, error) {
+func (b *WPSBackend) wpsPollAndFetch(ctx context.Context, service domain.ProcessingService, jobID string) ([]OutputResult, error) {
 	interval := initialPollInterval
 
 	for {
