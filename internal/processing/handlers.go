@@ -322,7 +322,7 @@ func (h *Handlers) HandleGetProcessingConfig() echo.HandlerFunc {
 }
 
 // HandleSyncProcessingService re-fetches all process descriptions from the
-// remote OGC API endpoint and merges them with existing per-process overrides.
+// remote processing service and updates the stored configuration.
 func (h *Handlers) HandleSyncProcessingService() echo.HandlerFunc {
 	return func(c echo.Context) error {
 		projectName := c.Get("project").(string)
