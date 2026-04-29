@@ -112,6 +112,27 @@ type wpsFormat struct {
 type wpsBoundingBoxData struct{}
 
 // ---------------------------------------------------------------------------
+// WPS 1.0 XML structs — GetCapabilities response
+// ---------------------------------------------------------------------------
+
+type wps1Capabilities struct {
+	XMLName          xml.Name             `xml:"http://www.opengis.net/wps/1.0.0 WPS_Capabilities"`
+	Version          string               `xml:"version,attr"`
+	ProcessOfferings wps1ProcessOfferings `xml:"http://www.opengis.net/wps/1.0.0 ProcessOfferings"`
+}
+
+type wps1ProcessOfferings struct {
+	Processes []wps1ProcessBrief `xml:"http://www.opengis.net/wps/1.0.0 Process"`
+}
+
+type wps1ProcessBrief struct {
+	Identifier owsIdentifier `xml:"http://www.opengis.net/ows/1.1 Identifier"`
+	Title      string        `xml:"http://www.opengis.net/ows/1.1 Title"`
+	Abstract   string        `xml:"http://www.opengis.net/ows/1.1 Abstract"`
+	Keywords   owsKeywords   `xml:"http://www.opengis.net/ows/1.1 Keywords"`
+}
+
+// ---------------------------------------------------------------------------
 // WPSBackend
 // ---------------------------------------------------------------------------
 
@@ -283,11 +304,53 @@ func (b *WPSBackend) wpsMajorVersion(ctx context.Context, service domain.Process
 	return major, nil
 }
 
+func parseWPS1ProcessList(body []byte) ([]ProcessSummary, error) {
+	var caps wps1Capabilities
+	if err := xml.Unmarshal(body, &caps); err != nil {
+		return nil, fmt.Errorf("decoding WPS 1.0 Capabilities XML: %w", err)
+	}
+	summaries := make([]ProcessSummary, 0, len(caps.ProcessOfferings.Processes))
+	for _, ps := range caps.ProcessOfferings.Processes {
+		summaries = append(summaries, ProcessSummary{
+			ID:                 ps.Identifier.Value,
+			Title:              ps.Title,
+			Description:        ps.Abstract,
+			Keywords:           ps.Keywords.Keyword,
+			JobControlOptions:  []string{"async-execute", "sync-execute"},
+			OutputTransmission: []string{"value", "reference"},
+		})
+	}
+	return summaries, nil
+}
+
+func parseWPS2ProcessList(body []byte) ([]ProcessSummary, error) {
+	var caps wpsCapabilities
+	if err := xml.Unmarshal(body, &caps); err != nil {
+		return nil, fmt.Errorf("decoding WPS Capabilities XML: %w", err)
+	}
+	summaries := make([]ProcessSummary, 0, len(caps.Contents.Processes))
+	for _, ps := range caps.Contents.Processes {
+		var jco []string
+		if ps.JobControlOptions != "" {
+			jco = strings.Fields(ps.JobControlOptions)
+		}
+		summaries = append(summaries, ProcessSummary{
+			ID:                 ps.Identifier.Value,
+			Title:              ps.Title,
+			Description:        ps.Abstract,
+			Keywords:           ps.Keywords.Keyword,
+			Version:            "",
+			JobControlOptions:  jco,
+			OutputTransmission: []string{"value", "reference"},
+		})
+	}
+	return summaries, nil
+}
+
 // FetchProcessList calls GetCapabilities and returns a ProcessSummary slice.
 func (b *WPSBackend) FetchProcessList(ctx context.Context, service domain.ProcessingService) ([]ProcessSummary, error) {
-	url := wpsQueryURL(service.URL, "GetCapabilities", "")
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	capsURL := service.URL + "?service=WPS&request=GetCapabilities"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, capsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("building WPS GetCapabilities request: %w", err)
 	}
@@ -306,29 +369,22 @@ func (b *WPSBackend) FetchProcessList(ctx context.Context, service domain.Proces
 		return nil, fmt.Errorf("WPS GetCapabilities returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var caps wpsCapabilities
-	if err := xml.NewDecoder(resp.Body).Decode(&caps); err != nil {
-		return nil, fmt.Errorf("decoding WPS Capabilities XML: %w", err)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading WPS GetCapabilities body: %w", err)
 	}
 
-	summaries := make([]ProcessSummary, 0, len(caps.Contents.Processes))
-	for _, ps := range caps.Contents.Processes {
-		var jco []string
-		if ps.JobControlOptions != "" {
-			jco = strings.Fields(ps.JobControlOptions)
-		}
-		summaries = append(summaries, ProcessSummary{
-			ID:                 ps.Identifier.Value,
-			Title:              ps.Title,
-			Description:        ps.Abstract,
-			Keywords:           ps.Keywords.Keyword,
-			Version:            "",
-			JobControlOptions:  jco,
-			OutputTransmission: []string{"value", "reference"},
-		})
+	major, err := wpsDetectMajorVersion(body)
+	if err != nil {
+		return nil, err
 	}
-	b.log.Debugw("WPS GetCapabilities", "service", service.URL, "count", len(summaries))
-	return summaries, nil
+	b.versionCache.Store(service.URL, major)
+	b.log.Debugw("WPS GetCapabilities", "service", service.URL, "majorVersion", major)
+
+	if major == 1 {
+		return parseWPS1ProcessList(body)
+	}
+	return parseWPS2ProcessList(body)
 }
 
 // DescribeProcess calls DescribeProcess and translates the WPS XML to a

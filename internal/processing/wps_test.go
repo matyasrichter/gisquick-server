@@ -3,6 +3,7 @@ package processing
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -472,6 +473,50 @@ func TestLiteralDataType(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// FetchProcessList — WPS 1.0
+// ---------------------------------------------------------------------------
+
+func TestWPS1FetchProcessList(t *testing.T) {
+	capsXML := `<?xml version="1.0" encoding="UTF-8"?>
+<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
+    xmlns:ows="http://www.opengis.net/ows/1.1"
+    version="1.0.0" service="WPS">
+  <wps:ProcessOfferings>
+    <wps:Process wps:processVersion="1.0">
+      <ows:Identifier>buffer</ows:Identifier>
+      <ows:Title>Buffer</ows:Title>
+      <ows:Abstract>Buffers features</ows:Abstract>
+      <ows:Keywords><ows:Keyword>geo</ows:Keyword></ows:Keywords>
+    </wps:Process>
+    <wps:Process wps:processVersion="1.0">
+      <ows:Identifier>clip</ows:Identifier>
+      <ows:Title>Clip</ows:Title>
+      <ows:Abstract></ows:Abstract>
+    </wps:Process>
+  </wps:ProcessOfferings>
+</wps:WPS_Capabilities>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprint(w, capsXML)
+	}))
+	defer srv.Close()
+
+	backend := &WPSBackend{client: srv.Client(), log: zap.NewNop().Sugar()}
+	service := domain.ProcessingService{URL: srv.URL}
+	summaries, err := backend.FetchProcessList(context.Background(), service)
+	require.NoError(t, err)
+	require.Len(t, summaries, 2)
+
+	assert.Equal(t, "buffer", summaries[0].ID)
+	assert.Equal(t, "Buffer", summaries[0].Title)
+	assert.Equal(t, "Buffers features", summaries[0].Description)
+	assert.Equal(t, []string{"geo"}, summaries[0].Keywords)
+
+	assert.Equal(t, "clip", summaries[1].ID)
 }
 
 // ---------------------------------------------------------------------------
