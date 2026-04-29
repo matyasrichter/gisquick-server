@@ -40,20 +40,20 @@ func (s *inMemJobStore) Get(_ context.Context, project, jobID string) (*JobRecor
 }
 
 // newTestHandlers creates a Handlers instance suitable for unit tests.
-// Pass an optional *http.Client to override the OGC client's HTTP client (e.g. for fake servers).
+// Pass an optional *http.Client to override the shared HTTP client (e.g. for fake servers).
 func newTestHandlers(projects *mock.ProjectService, httpClient *http.Client) *Handlers {
 	log := zap.NewNop().Sugar()
-	h := &Handlers{
+	client := httpClient
+	if client == nil {
+		client = &http.Client{}
+	}
+	return &Handlers{
 		projects:   projects,
-		ogcClient:  NewOGCAPIClient(log),
+		httpClient: client,
 		qgisPlugin: NewQGISPluginClient("http://unused", ""),
 		log:        log,
 		jobs:       &inMemJobStore{},
 	}
-	if httpClient != nil {
-		h.ogcClient.httpClient = httpClient
-	}
-	return h
 }
 
 // newEchoCtx returns an Echo context backed by a response recorder.
@@ -146,6 +146,37 @@ func TestHandleGetProcessingConfig(t *testing.T) {
 }
 
 func TestHandleAddProcessingServiceWPS(t *testing.T) {
+	// Fake WPS server returning a minimal GetCapabilities and DescribeProcess response.
+	fakeWPS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("request") {
+		case "GetCapabilities":
+			w.Header().Set("Content-Type", "application/xml")
+			io.WriteString(w, `<?xml version="1.0"?>
+<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/2.0" xmlns:ows="http://www.opengis.net/ows/1.1">
+  <wps:Contents>
+    <wps:ProcessSummary jobControlOptions="async-execute">
+      <ows:Identifier>buffer</ows:Identifier>
+      <ows:Title>Buffer</ows:Title>
+    </wps:ProcessSummary>
+  </wps:Contents>
+</wps:Capabilities>`)
+		case "DescribeProcess":
+			w.Header().Set("Content-Type", "application/xml")
+			io.WriteString(w, `<?xml version="1.0"?>
+<wps:ProcessOfferings xmlns:wps="http://www.opengis.net/wps/2.0" xmlns:ows="http://www.opengis.net/ows/1.1">
+  <wps:ProcessOffering jobControlOptions="async-execute">
+    <wps:Process>
+      <ows:Identifier>buffer</ows:Identifier>
+      <ows:Title>Buffer</ows:Title>
+    </wps:Process>
+  </wps:ProcessOffering>
+</wps:ProcessOfferings>`)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer fakeWPS.Close()
+
 	var saved domain.ProcessingConfig
 	projects := &mock.ProjectService{
 		GetProcessingConfigFunc: func(n string) (domain.ProcessingConfig, error) {
@@ -157,9 +188,9 @@ func TestHandleAddProcessingServiceWPS(t *testing.T) {
 		},
 	}
 
-	h := newTestHandlers(projects, nil)
-	body := `{"url":"http://wps.example.com","type":"wps","name":"My WPS"}`
-	c, rec := newEchoCtx(http.MethodPost, "/", body)
+	h := newTestHandlers(projects, fakeWPS.Client())
+	reqBody := `{"url":"` + fakeWPS.URL + `","type":"wps","name":"My WPS"}`
+	c, rec := newEchoCtx(http.MethodPost, "/", reqBody)
 
 	if err := h.HandleAddProcessingService()(c); err != nil {
 		t.Fatalf("handler returned error: %v", err)
@@ -171,11 +202,19 @@ func TestHandleAddProcessingServiceWPS(t *testing.T) {
 		t.Fatalf("expected 1 saved service, got %d", len(saved.Services))
 	}
 	svc := saved.Services[0]
-	if svc.URL != "http://wps.example.com" || svc.Type != domain.ProcessingServiceTypeWPS {
-		t.Errorf("unexpected saved service: %+v", svc)
+	if svc.Type != domain.ProcessingServiceTypeWPS {
+		t.Errorf("unexpected saved service type: %+v", svc)
 	}
 	if svc.ID == "" {
 		t.Error("expected non-empty service ID")
+	}
+	// WPS backend should have fetched and stored the 'buffer' process.
+	procCfg, ok := svc.Processes["buffer"]
+	if !ok {
+		t.Fatal("expected 'buffer' process to be stored")
+	}
+	if procCfg.Title != "Buffer" {
+		t.Errorf("expected title 'Buffer', got %q", procCfg.Title)
 	}
 }
 

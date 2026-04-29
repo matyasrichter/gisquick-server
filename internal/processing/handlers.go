@@ -25,7 +25,7 @@ const executionTimeout = 30 * time.Minute
 // Handlers provides HTTP handlers for the processing module.
 type Handlers struct {
 	projects     application.ProjectService
-	ogcClient    *OGCAPIClient
+	httpClient   *http.Client
 	qgisPlugin   *QGISPluginClient
 	log          *zap.SugaredLogger
 	mapserverURL string
@@ -36,7 +36,7 @@ type Handlers struct {
 func NewHandlers(projects application.ProjectService, log *zap.SugaredLogger, mapserverURL, publishRoot, pluginSecret string, jobs JobStore) *Handlers {
 	return &Handlers{
 		projects:     projects,
-		ogcClient:    NewOGCAPIClient(log),
+		httpClient:   &http.Client{Timeout: 60 * time.Second},
 		qgisPlugin:   NewQGISPluginClient(mapserverURL, pluginSecret),
 		log:          log,
 		mapserverURL: mapserverURL,
@@ -110,25 +110,14 @@ func baseURL(c echo.Context, projectName string) string {
 	return fmt.Sprintf("%s://%s/api/map/ogc-processes/%s", scheme, host, projectName)
 }
 
-// findOGCServiceByID finds an OGC service by its UUID among OGC-type services.
-func findOGCServiceByID(services []domain.ProcessingService, serviceID string) (domain.ProcessingService, bool) {
+// findServiceByID finds a processing service by its UUID among all configured services.
+func findServiceByID(services []domain.ProcessingService, serviceID string) (domain.ProcessingService, bool) {
 	for _, s := range services {
 		if s.ID == serviceID {
 			return s, true
 		}
 	}
 	return domain.ProcessingService{}, false
-}
-
-// ogcServices filters configured services to only OGC API Processes backends.
-func ogcServices(cfg domain.ProcessingConfig) []domain.ProcessingService {
-	var services []domain.ProcessingService
-	for _, s := range cfg.Services {
-		if s.Type == domain.ProcessingServiceTypeOGCProcesses {
-			services = append(services, s)
-		}
-	}
-	return services
 }
 
 // serviceRequest is the shared request body for processing service CRUD operations.
@@ -159,72 +148,36 @@ func (r *serviceRequest) toService() domain.ProcessingService {
 	}
 }
 
-// remoteProcessList is used to parse the process list response from an OGC API backend.
-type remoteProcessList struct {
-	Processes []struct {
-		ID string `json:"id"`
-	} `json:"processes"`
-}
+// fetchAndStoreProcesses uses the backend to fetch all process summaries and
+// descriptions from the remote service, then stores them in svc.Processes.
+func (h *Handlers) fetchAndStoreProcesses(ctx context.Context, svc *domain.ProcessingService) error {
+	backend := NewBackend(*svc, h.httpClient, h.log)
+	if backend == nil {
+		return nil // unsupported type — leave Processes empty
+	}
 
-// fetchRemoteProcesses retrieves the full process descriptions from an OGC API backend.
-// The provided headers are forwarded on every request (e.g. for authentication).
-func (h *Handlers) fetchRemoteProcesses(svcURL string, svcHeaders map[string]string) (map[string]domain.ProcessConfig, error) {
-	base := strings.TrimRight(svcURL, "/")
-	fwdHeaders := toHTTPHeader(svcHeaders)
-
-	resp, err := h.ogcClient.ForwardRequest(http.MethodGet, base+"/processes", nil, fwdHeaders)
+	summaries, err := backend.FetchProcessList(ctx, *svc)
 	if err != nil {
-		return nil, fmt.Errorf("fetching process list: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("process list returned status %d", resp.StatusCode)
+		return fmt.Errorf("fetching process list: %w", err)
 	}
 
-	var list remoteProcessList
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, fmt.Errorf("decoding process list: %w", err)
-	}
-
-	result := make(map[string]domain.ProcessConfig, len(list.Processes))
-	for _, p := range list.Processes {
-		descResp, err := h.ogcClient.ForwardRequest(http.MethodGet, base+"/processes/"+p.ID, nil, fwdHeaders)
+	processes := make(map[string]domain.ProcessConfig, len(summaries))
+	for _, s := range summaries {
+		desc, err := backend.DescribeProcess(ctx, *svc, s.ID)
 		if err != nil {
-			return nil, fmt.Errorf("fetching process %q: %w", p.ID, err)
+			return fmt.Errorf("describing process %q: %w", s.ID, err)
 		}
-		defer descResp.Body.Close()
-		if descResp.StatusCode < 200 || descResp.StatusCode >= 300 {
-			return nil, fmt.Errorf("process %q description returned status %d", p.ID, descResp.StatusCode)
-		}
-
-		raw, err := io.ReadAll(descResp.Body)
+		descJSON, err := json.Marshal(desc)
 		if err != nil {
-			return nil, fmt.Errorf("reading process %q description: %w", p.ID, err)
+			return fmt.Errorf("marshaling process description for %q: %w", s.ID, err)
 		}
-
-		var meta struct {
-			Title string `json:"title"`
-		}
-		_ = json.Unmarshal(raw, &meta)
-
-		result[p.ID] = domain.ProcessConfig{
-			Title:       meta.Title,
-			Description: json.RawMessage(raw),
+		processes[s.ID] = domain.ProcessConfig{
+			Title:       desc.Title,
+			Description: json.RawMessage(descJSON),
 		}
 	}
-	return result, nil
-}
-
-// toHTTPHeader converts a map[string]string to http.Header.
-func toHTTPHeader(m map[string]string) http.Header {
-	if len(m) == 0 {
-		return nil
-	}
-	h := make(http.Header, len(m))
-	for k, v := range m {
-		h.Set(k, v)
-	}
-	return h
+	svc.Processes = processes
+	return nil
 }
 
 // HandleAddProcessingService handles POST requests to append a processing service.
@@ -253,13 +206,9 @@ func (h *Handlers) HandleAddProcessingService() echo.HandlerFunc {
 		}
 		svc.ID = id.String()
 
-		if svc.Type == domain.ProcessingServiceTypeOGCProcesses {
-			fetched, err := h.fetchRemoteProcesses(svc.URL, svc.Headers)
-			if err != nil {
-				h.log.Errorw("fetching remote process descriptions", "url", svc.URL, zap.Error(err))
-				return echo.NewHTTPError(http.StatusBadGateway, "Failed to fetch process descriptions from remote")
-			}
-			svc.Processes = fetched
+		if err := h.fetchAndStoreProcesses(c.Request().Context(), &svc); err != nil {
+			h.log.Errorw("fetching remote process descriptions", "url", svc.URL, zap.Error(err))
+			return echo.NewHTTPError(http.StatusBadGateway, "Failed to fetch process descriptions from remote")
 		}
 
 		cfg.Services = append(cfg.Services, svc)
@@ -306,16 +255,14 @@ func (h *Handlers) HandleUpdateProcessingService() echo.HandlerFunc {
 		updated := req.toService()
 		updated.ID = serviceID
 
-		if updated.Type == domain.ProcessingServiceTypeOGCProcesses {
-			existing := cfg.Services[idx].Processes
-			kept := make(map[string]domain.ProcessConfig, len(req.Processes))
-			for _, id := range req.Processes {
-				if proc, ok := existing[id]; ok {
-					kept[id] = proc
-				}
+		existing := cfg.Services[idx].Processes
+		kept := make(map[string]domain.ProcessConfig, len(req.Processes))
+		for _, id := range req.Processes {
+			if proc, ok := existing[id]; ok {
+				kept[id] = proc
 			}
-			updated.Processes = kept
 		}
+		updated.Processes = kept
 
 		cfg.Services[idx] = updated
 
@@ -399,16 +346,10 @@ func (h *Handlers) HandleSyncProcessingService() echo.HandlerFunc {
 		}
 
 		svc := cfg.Services[idx]
-		if svc.Type != domain.ProcessingServiceTypeOGCProcesses {
-			return echo.NewHTTPError(http.StatusBadRequest, "Only OGC API Processes services support sync")
-		}
-
-		fetched, err := h.fetchRemoteProcesses(svc.URL, svc.Headers)
-		if err != nil {
+		if err := h.fetchAndStoreProcesses(c.Request().Context(), &svc); err != nil {
 			h.log.Errorw("syncing remote process descriptions", "url", svc.URL, zap.Error(err))
 			return echo.NewHTTPError(http.StatusBadGateway, "Failed to fetch process descriptions from remote")
 		}
-		svc.Processes = fetched
 		cfg.Services[idx] = svc
 
 		if err := h.projects.UpdateProcessingConfig(projectName, cfg); err != nil {
@@ -463,10 +404,9 @@ func (h *Handlers) HandleProcessList() echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to read processing config")
 		}
 
-		services := ogcServices(cfg)
 		var allProcesses []ProcessSummary
 
-		for _, svc := range services {
+		for _, svc := range cfg.Services {
 			for processID, procCfg := range svc.Processes {
 				prefixedID := PrefixProcessID(svc.ID, processID)
 
@@ -522,8 +462,7 @@ func (h *Handlers) HandleProcessDescription() echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to read processing config")
 		}
 
-		services := ogcServices(cfg)
-		svc, found := findOGCServiceByID(services, svcID)
+		svc, found := findServiceByID(cfg.Services, svcID)
 		if !found {
 			return echo.NewHTTPError(http.StatusNotFound, "Process not found")
 		}
@@ -571,8 +510,7 @@ func (h *Handlers) HandleExecute() echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to read processing config")
 		}
 
-		services := ogcServices(cfg)
-		svc, found := findOGCServiceByID(services, svcID)
+		svc, found := findServiceByID(cfg.Services, svcID)
 		if !found {
 			return echo.NewHTTPError(http.StatusNotFound, "Process not found")
 		}
@@ -587,15 +525,9 @@ func (h *Handlers) HandleExecute() echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusNotFound, "Process not configured")
 		}
 
-		payload, err := io.ReadAll(c.Request().Body)
+		body, err := io.ReadAll(c.Request().Body)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, "Failed to read request body")
-		}
-
-		remote := domain.RemoteConfig{
-			ExecuteURL: strings.TrimRight(svc.URL, "/") + "/processes/" + originalID + "/execution",
-			Type:       string(svc.Type),
-			Headers:    svc.Headers,
 		}
 
 		jobUUID, err := uuid.NewV4()
@@ -622,7 +554,7 @@ func (h *Handlers) HandleExecute() echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to persist job record")
 		}
 
-		go h.runJob(projectName, ourJobID, base, remote, payload, originalID)
+		go h.runJob(projectName, ourJobID, base, svc, body, originalID)
 
 		jobBase := base + "/jobs/" + ourJobID
 		resp := StatusInfo{
@@ -639,9 +571,9 @@ func (h *Handlers) HandleExecute() echo.HandlerFunc {
 	}
 }
 
-// runJob executes the process in the background: calls the remote OGC API, saves results
+// runJob executes the process in the background: calls the remote backend, saves results
 // to disk, asks the QGIS plugin to create a project, and updates the Redis job record.
-func (h *Handlers) runJob(projectName, jobID, base string, remote domain.RemoteConfig, payload []byte, processID string) {
+func (h *Handlers) runJob(projectName, jobID, base string, svc domain.ProcessingService, payload []byte, processID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), executionTimeout)
 	defer cancel()
 
@@ -653,23 +585,37 @@ func (h *Handlers) runJob(projectName, jobID, base string, remote domain.RemoteC
 		return
 	}
 
-	// 1. Execute against the remote OGC API backend.
-	remoteJobID, results, err := h.ogcClient.Execute(ctx, remote, payload)
+	backend := NewBackend(svc, h.httpClient, h.log)
+	if backend == nil {
+		h.failJob(ctx, projectName, jobID, fmt.Sprintf("unsupported service type: %s", svc.Type))
+		return
+	}
+
+	// 1. Load the current job record so backend.Execute can read stored process description.
+	record, err := h.jobs.Get(ctx, projectName, jobID)
 	if err != nil {
-		h.log.Errorw("executing OGC process", "process", processID, "jobID", jobID, zap.Error(err))
+		h.log.Errorw("fetching job record before execute", "jobID", jobID, zap.Error(err))
+		h.failJob(ctx, projectName, jobID, fmt.Sprintf("failed to load job record: %v", err))
+		return
+	}
+
+	// 2. Execute against the remote backend.
+	results, remoteJobID, err := backend.Execute(ctx, record, svc, json.RawMessage(payload))
+	if err != nil {
+		h.log.Errorw("executing process", "process", processID, "jobID", jobID, zap.Error(err))
 		h.failJob(ctx, projectName, jobID, err.Error())
 		return
 	}
 
-	// 2. Save results to disk.
-	artifacts, err := SaveResults(ctx, h.ogcClient.httpClient, jobDir, results, remote.Headers)
+	// 3. Save results to disk.
+	artifacts, err := SaveResults(ctx, h.httpClient, jobDir, results, svc.Headers)
 	if err != nil {
 		h.log.Errorw("saving job results", "jobID", jobID, zap.Error(err))
 		h.failJob(ctx, projectName, jobID, fmt.Sprintf("failed to save results: %v", err))
 		return
 	}
 
-	// 3. Ask the QGIS plugin to create a project file (non-fatal on error).
+	// 4. Ask the QGIS plugin to create a project file (non-fatal on error).
 	jobBase := base + "/jobs/" + jobID
 	var projectFile string
 	if len(artifacts) > 0 {
@@ -679,18 +625,13 @@ func (h *Handlers) runJob(projectName, jobID, base string, remote domain.RemoteC
 		}
 	}
 
-	// 4. Remap artifact download URLs to our own endpoint.
+	// 5. Remap artifact download URLs to our own endpoint.
 	for i, a := range artifacts {
 		artifacts[i].DownloadURL = jobBase + "/artifacts/" + a.Path
 	}
 
-	// 5. Update job record.
+	// 6. Update job record.
 	now := time.Now().UTC()
-	record, getErr := h.jobs.Get(ctx, projectName, jobID)
-	if getErr != nil {
-		h.log.Errorw("fetching job record for final update", "jobID", jobID, zap.Error(getErr))
-		return
-	}
 	record.Status = "successful"
 	record.RemoteJobID = remoteJobID
 	record.StoragePath = jobDir
