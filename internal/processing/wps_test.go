@@ -94,11 +94,15 @@ func TestWPSFetchProcessList(t *testing.T) {
 
 func TestWPSDescribeProcessTypeMapping(t *testing.T) {
 	fakeWPS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		if r.URL.Query().Get("request") == "GetCapabilities" {
+			io.WriteString(w, `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/2.0" version="2.0.0" service="WPS"><wps:Contents></wps:Contents></wps:Capabilities>`)
+			return
+		}
 		if r.URL.Query().Get("request") != "DescribeProcess" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		w.Header().Set("Content-Type", "application/xml")
 		io.WriteString(w, `<?xml version="1.0"?>
 <wps:ProcessOfferings xmlns:wps="http://www.opengis.net/wps/2.0" xmlns:ows="http://www.opengis.net/ows/1.1">
   <wps:ProcessOffering jobControlOptions="async-execute">
@@ -517,6 +521,106 @@ func TestWPS1FetchProcessList(t *testing.T) {
 	assert.Equal(t, []string{"geo"}, summaries[0].Keywords)
 
 	assert.Equal(t, "clip", summaries[1].ID)
+}
+
+// ---------------------------------------------------------------------------
+// DescribeProcess — WPS 1.0
+// ---------------------------------------------------------------------------
+
+func TestWPS1DescribeProcess(t *testing.T) {
+	capsXML := `<?xml version="1.0"?>
+<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
+    xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
+  <wps:ProcessOfferings>
+    <wps:Process><ows:Identifier>buffer</ows:Identifier><ows:Title>Buffer</ows:Title></wps:Process>
+  </wps:ProcessOfferings>
+</wps:WPS_Capabilities>`
+
+	describeXML := `<?xml version="1.0"?>
+<wps:ProcessDescriptions xmlns:wps="http://www.opengis.net/wps/1.0.0"
+    xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
+  <ProcessDescription wps:processVersion="1.0" statusSupported="true" storeSupported="true">
+    <ows:Identifier>buffer</ows:Identifier>
+    <ows:Title>Buffer</ows:Title>
+    <ows:Abstract>Buffers features by distance</ows:Abstract>
+    <DataInputs>
+      <Input minOccurs="1" maxOccurs="1">
+        <ows:Identifier>distance</ows:Identifier>
+        <ows:Title>Distance</ows:Title>
+        <LiteralData>
+          <ows:DataType ows:reference="http://www.w3.org/TR/xmlschema-2/#double">xs:double</ows:DataType>
+          <ows:AllowedValues><ows:AnyValue/></ows:AllowedValues>
+        </LiteralData>
+      </Input>
+      <Input minOccurs="1" maxOccurs="1">
+        <ows:Identifier>features</ows:Identifier>
+        <ows:Title>Input features</ows:Title>
+        <ComplexData>
+          <Default><Format><MimeType>application/geo+json</MimeType></Format></Default>
+          <Supported><Format><MimeType>application/geo+json</MimeType></Format></Supported>
+        </ComplexData>
+      </Input>
+      <Input minOccurs="0" maxOccurs="1">
+        <ows:Identifier>bbox</ows:Identifier>
+        <ows:Title>Bounding Box</ows:Title>
+        <BoundingBoxData>
+          <Default><CRS>EPSG:4326</CRS></Default>
+        </BoundingBoxData>
+      </Input>
+    </DataInputs>
+    <ProcessOutputs>
+      <Output>
+        <ows:Identifier>result</ows:Identifier>
+        <ows:Title>Buffered result</ows:Title>
+        <ComplexOutput>
+          <Default><Format><MimeType>application/geo+json</MimeType></Format></Default>
+        </ComplexOutput>
+      </Output>
+    </ProcessOutputs>
+  </ProcessDescription>
+</wps:ProcessDescriptions>`
+
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		reqParam := r.URL.Query().Get("request")
+		if reqParam == "GetCapabilities" {
+			fmt.Fprint(w, capsXML)
+		} else {
+			callCount++
+			fmt.Fprint(w, describeXML)
+		}
+	}))
+	defer srv.Close()
+
+	backend := &WPSBackend{client: srv.Client(), log: zap.NewNop().Sugar()}
+	service := domain.ProcessingService{URL: srv.URL}
+
+	desc, err := backend.DescribeProcess(context.Background(), service, "buffer")
+	require.NoError(t, err)
+	assert.Equal(t, "Buffer", desc.Title)
+	assert.Equal(t, "Buffers features by distance", desc.Description)
+	assert.Contains(t, desc.JobControlOptions, "async-execute")
+
+	var inputs map[string]any
+	require.NoError(t, json.Unmarshal(desc.Inputs, &inputs))
+	assert.Contains(t, inputs, "distance")
+	assert.Contains(t, inputs, "features")
+	assert.Contains(t, inputs, "bbox")
+
+	distSchema := inputs["distance"].(map[string]any)["schema"].(map[string]any)
+	assert.Equal(t, "number", distSchema["type"])
+
+	featSchema := inputs["features"].(map[string]any)["schema"].(map[string]any)
+	assert.Equal(t, "geojson", featSchema["format"])
+
+	bboxInputSchema := inputs["bbox"].(map[string]any)["schema"].(map[string]any)
+	assert.Equal(t, "bbox", bboxInputSchema["format"])
+
+	var outputs map[string]any
+	require.NoError(t, json.Unmarshal(desc.Outputs, &outputs))
+	assert.Contains(t, outputs, "result")
+	assert.Equal(t, 1, callCount)
 }
 
 // ---------------------------------------------------------------------------

@@ -133,6 +133,98 @@ type wps1ProcessBrief struct {
 }
 
 // ---------------------------------------------------------------------------
+// WPS 1.0 XML structs — DescribeProcess response
+// ---------------------------------------------------------------------------
+
+type wps1ProcessDescriptions struct {
+	XMLName   xml.Name                 `xml:"http://www.opengis.net/wps/1.0.0 ProcessDescriptions"`
+	Processes []wps1ProcessDescription `xml:"ProcessDescription"`
+}
+
+type wps1ProcessDescription struct {
+	Identifier      owsIdentifier      `xml:"http://www.opengis.net/ows/1.1 Identifier"`
+	Title           string             `xml:"http://www.opengis.net/ows/1.1 Title"`
+	Abstract        string             `xml:"http://www.opengis.net/ows/1.1 Abstract"`
+	StatusSupported bool               `xml:"statusSupported,attr"`
+	StoreSupported  bool               `xml:"storeSupported,attr"`
+	DataInputs      wps1DataInputsElem `xml:"DataInputs"`
+	ProcessOutputs  wps1ProcessOutputs `xml:"ProcessOutputs"`
+}
+
+type wps1DataInputsElem struct {
+	Inputs []wps1Input `xml:"Input"`
+}
+
+type wps1Input struct {
+	Identifier      owsIdentifier        `xml:"http://www.opengis.net/ows/1.1 Identifier"`
+	Title           string               `xml:"http://www.opengis.net/ows/1.1 Title"`
+	Abstract        string               `xml:"http://www.opengis.net/ows/1.1 Abstract"`
+	MinOccurs       int                  `xml:"minOccurs,attr"`
+	MaxOccurs       int                  `xml:"maxOccurs,attr"`
+	LiteralData     *wps1LiteralData     `xml:"LiteralData"`
+	ComplexData     *wps1ComplexData     `xml:"ComplexData"`
+	BoundingBoxData *wps1BoundingBoxData `xml:"BoundingBoxData"`
+}
+
+type wps1LiteralData struct {
+	DataType      wps1DataType      `xml:"http://www.opengis.net/ows/1.1 DataType"`
+	AllowedValues *owsAllowedValues `xml:"http://www.opengis.net/ows/1.1 AllowedValues"`
+}
+
+type wps1DataType struct {
+	Reference string `xml:"reference,attr"`
+	Value     string `xml:",chardata"`
+}
+
+type wps1ComplexData struct {
+	Default   wps1ComplexDefault   `xml:"Default"`
+	Supported wps1ComplexSupported `xml:"Supported"`
+}
+
+type wps1ComplexDefault struct {
+	Format wps1Format `xml:"Format"`
+}
+
+type wps1ComplexSupported struct {
+	Formats []wps1Format `xml:"Format"`
+}
+
+type wps1Format struct {
+	MimeType string `xml:"MimeType"`
+	Schema   string `xml:"Schema"`
+}
+
+type wps1BoundingBoxData struct {
+	Default wps1BBoxDefault `xml:"Default"`
+}
+
+type wps1BBoxDefault struct {
+	CRS string `xml:"CRS"`
+}
+
+type wps1ProcessOutputs struct {
+	Outputs []wps1Output `xml:"Output"`
+}
+
+type wps1Output struct {
+	Identifier    owsIdentifier        `xml:"http://www.opengis.net/ows/1.1 Identifier"`
+	Title         string               `xml:"http://www.opengis.net/ows/1.1 Title"`
+	Abstract      string               `xml:"http://www.opengis.net/ows/1.1 Abstract"`
+	ComplexOutput *wps1ComplexOutput   `xml:"ComplexOutput"`
+	LiteralOutput *wps1LiteralOutput   `xml:"LiteralOutput"`
+	BBoxOutput    *wps1BoundingBoxData `xml:"BoundingBoxOutput"`
+}
+
+type wps1ComplexOutput struct {
+	Default   wps1ComplexDefault   `xml:"Default"`
+	Supported wps1ComplexSupported `xml:"Supported"`
+}
+
+type wps1LiteralOutput struct {
+	DataType wps1DataType `xml:"http://www.opengis.net/ows/1.1 DataType"`
+}
+
+// ---------------------------------------------------------------------------
 // WPSBackend
 // ---------------------------------------------------------------------------
 
@@ -390,9 +482,19 @@ func (b *WPSBackend) FetchProcessList(ctx context.Context, service domain.Proces
 // DescribeProcess calls DescribeProcess and translates the WPS XML to a
 // ProcessDescription whose Inputs/Outputs fields carry OGC API JSON schemas.
 func (b *WPSBackend) DescribeProcess(ctx context.Context, service domain.ProcessingService, processID string) (*ProcessDescription, error) {
-	url := wpsQueryURL(service.URL, "DescribeProcess", processID)
+	major, err := b.wpsMajorVersion(ctx, service)
+	if err != nil {
+		return nil, err
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	var descURL string
+	if major == 1 {
+		descURL = service.URL + "?service=WPS&version=1.0.0&request=DescribeProcess&Identifier=" + url.QueryEscape(processID)
+	} else {
+		descURL = wpsQueryURL(service.URL, "DescribeProcess", processID)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, descURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("building WPS DescribeProcess request: %w", err)
 	}
@@ -411,8 +513,19 @@ func (b *WPSBackend) DescribeProcess(ctx context.Context, service domain.Process
 		return nil, fmt.Errorf("WPS DescribeProcess returned status %d: %s", resp.StatusCode, string(body))
 	}
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading WPS DescribeProcess body: %w", err)
+	}
+
+	b.log.Debugw("WPS DescribeProcess", "service", service.URL, "processID", processID, "majorVersion", major)
+
+	if major == 1 {
+		return parseWPS1ProcessDescription(body, processID)
+	}
+
 	var offerings wpsProcessOfferings
-	if err := xml.NewDecoder(resp.Body).Decode(&offerings); err != nil {
+	if err := xml.Unmarshal(body, &offerings); err != nil {
 		return nil, fmt.Errorf("decoding WPS ProcessOfferings XML: %w", err)
 	}
 
@@ -459,8 +572,6 @@ func (b *WPSBackend) DescribeProcess(ctx context.Context, service domain.Process
 	if err != nil {
 		return nil, fmt.Errorf("encoding outputs schema: %w", err)
 	}
-
-	b.log.Debugw("WPS DescribeProcess", "service", service.URL, "processID", processID)
 
 	return &ProcessDescription{
 		Title:             offering.Process.Title,
@@ -959,4 +1070,142 @@ func literalDataType(dt string) string {
 	default:
 		return "string"
 	}
+}
+
+// ---------------------------------------------------------------------------
+// WPS 1.0 translation helpers: XML → OGC API JSON Schema
+// ---------------------------------------------------------------------------
+
+func wps1InputToOGCAPI(inp wps1Input) map[string]any {
+	entry := map[string]any{
+		"title":  inp.Title,
+		"schema": wps1InputSchema(inp),
+	}
+	if inp.Abstract != "" {
+		entry["description"] = inp.Abstract
+	}
+	return entry
+}
+
+func wps1OutputToOGCAPI(out wps1Output) map[string]any {
+	entry := map[string]any{
+		"title":  out.Title,
+		"schema": wps1OutputSchema(out),
+	}
+	if out.Abstract != "" {
+		entry["description"] = out.Abstract
+	}
+	return entry
+}
+
+func wps1InputSchema(inp wps1Input) map[string]any {
+	if inp.BoundingBoxData != nil {
+		return bboxSchema()
+	}
+	if inp.ComplexData != nil {
+		return wps1ComplexDataSchema(&inp.ComplexData.Default.Format)
+	}
+	if inp.LiteralData != nil {
+		return wps1LiteralDataSchema(inp.LiteralData)
+	}
+	return map[string]any{"type": "string"}
+}
+
+func wps1OutputSchema(out wps1Output) map[string]any {
+	if out.BBoxOutput != nil {
+		return bboxSchema()
+	}
+	if out.ComplexOutput != nil {
+		return wps1ComplexDataSchema(&out.ComplexOutput.Default.Format)
+	}
+	if out.LiteralOutput != nil {
+		return wps1LiteralOutputSchema(out.LiteralOutput)
+	}
+	return map[string]any{"type": "string"}
+}
+
+func wps1ComplexDataSchema(f *wps1Format) map[string]any {
+	mt := strings.ToLower(f.MimeType)
+	if strings.Contains(mt, "geo+json") || strings.Contains(mt, "geojson") {
+		return map[string]any{"type": "object", "format": "geojson"}
+	}
+	return map[string]any{"type": "object"}
+}
+
+func wps1LiteralDataSchema(ld *wps1LiteralData) map[string]any {
+	dt := ld.DataType.Reference
+	if dt == "" {
+		dt = ld.DataType.Value
+	}
+	schema := map[string]any{"type": literalDataType(dt)}
+	if ld.AllowedValues != nil && len(ld.AllowedValues.Values) > 0 {
+		enum := make([]any, len(ld.AllowedValues.Values))
+		for i, v := range ld.AllowedValues.Values {
+			enum[i] = v
+		}
+		schema["enum"] = enum
+	}
+	return schema
+}
+
+func wps1LiteralOutputSchema(lo *wps1LiteralOutput) map[string]any {
+	dt := lo.DataType.Reference
+	if dt == "" {
+		dt = lo.DataType.Value
+	}
+	return map[string]any{"type": literalDataType(dt)}
+}
+
+func parseWPS1ProcessDescription(body []byte, processID string) (*ProcessDescription, error) {
+	var descs wps1ProcessDescriptions
+	if err := xml.Unmarshal(body, &descs); err != nil {
+		return nil, fmt.Errorf("decoding WPS 1.0 ProcessDescriptions XML: %w", err)
+	}
+
+	var pd *wps1ProcessDescription
+	for i := range descs.Processes {
+		if descs.Processes[i].Identifier.Value == processID {
+			pd = &descs.Processes[i]
+			break
+		}
+	}
+	if pd == nil {
+		if len(descs.Processes) > 0 {
+			pd = &descs.Processes[0]
+		} else {
+			return nil, fmt.Errorf("process %q not found in WPS 1.0 DescribeProcess response", processID)
+		}
+	}
+
+	jco := []string{"sync-execute"}
+	if pd.StoreSupported && pd.StatusSupported {
+		jco = []string{"async-execute", "sync-execute"}
+	}
+
+	inputsMap := make(map[string]any, len(pd.DataInputs.Inputs))
+	for _, inp := range pd.DataInputs.Inputs {
+		inputsMap[inp.Identifier.Value] = wps1InputToOGCAPI(inp)
+	}
+	outputsMap := make(map[string]any, len(pd.ProcessOutputs.Outputs))
+	for _, out := range pd.ProcessOutputs.Outputs {
+		outputsMap[out.Identifier.Value] = wps1OutputToOGCAPI(out)
+	}
+
+	inputsJSON, err := json.Marshal(inputsMap)
+	if err != nil {
+		return nil, fmt.Errorf("encoding inputs schema: %w", err)
+	}
+	outputsJSON, err := json.Marshal(outputsMap)
+	if err != nil {
+		return nil, fmt.Errorf("encoding outputs schema: %w", err)
+	}
+
+	return &ProcessDescription{
+		Title:             pd.Title,
+		Description:       pd.Abstract,
+		Version:           "",
+		JobControlOptions: jco,
+		Inputs:            json.RawMessage(inputsJSON),
+		Outputs:           json.RawMessage(outputsJSON),
+	}, nil
 }
