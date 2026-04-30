@@ -1333,13 +1333,34 @@ func bboxSchema() map[string]any {
 }
 
 func complexDataSchema(cd *wpsComplexData) map[string]any {
+	schema := map[string]any{"type": "object"}
+	var geomFormat string
+	var mimeTypes []any
 	for _, f := range cd.Formats {
-		mt := strings.ToLower(f.MimeType)
-		if strings.Contains(mt, "geo+json") || strings.Contains(mt, "geojson") {
-			return map[string]any{"type": "object", "format": "geojson"}
+		if f.MimeType != "" {
+			mimeTypes = append(mimeTypes, f.MimeType)
+		}
+		if geomFormat == "" {
+			mt := strings.ToLower(f.MimeType)
+			switch {
+			case strings.Contains(mt, "geo+json") || strings.Contains(mt, "geojson"):
+				geomFormat = "geojson"
+			case strings.Contains(mt, "gml"):
+				geomFormat = "gml"
+			case strings.Contains(mt, "wkt"):
+				geomFormat = "wkt"
+			case strings.Contains(mt, "wkb"):
+				geomFormat = "wkb"
+			}
 		}
 	}
-	return map[string]any{"type": "object"}
+	if geomFormat != "" {
+		schema["format"] = geomFormat
+	}
+	if len(mimeTypes) > 0 {
+		schema["contentMediaTypes"] = mimeTypes
+	}
+	return schema
 }
 
 func literalDataSchema(ld *wpsLiteralData) map[string]any {
@@ -1411,7 +1432,7 @@ func wps1InputSchema(inp wps1Input) map[string]any {
 		return bboxSchema()
 	}
 	if inp.ComplexData != nil {
-		return wps1ComplexDataSchema(&inp.ComplexData.Default.Format)
+		return wps1ComplexDataSchema(inp.ComplexData)
 	}
 	if inp.LiteralData != nil {
 		return wps1LiteralDataSchema(inp.LiteralData)
@@ -1424,7 +1445,7 @@ func wps1OutputSchema(out wps1Output) map[string]any {
 		return bboxSchema()
 	}
 	if out.ComplexOutput != nil {
-		return wps1ComplexDataSchema(&out.ComplexOutput.Default.Format)
+		return wps1ComplexDataSchema((*wps1ComplexData)(out.ComplexOutput))
 	}
 	if out.LiteralOutput != nil {
 		return wps1LiteralOutputSchema(out.LiteralOutput)
@@ -1432,12 +1453,42 @@ func wps1OutputSchema(out wps1Output) map[string]any {
 	return map[string]any{"type": "string"}
 }
 
-func wps1ComplexDataSchema(f *wps1Format) map[string]any {
-	mt := strings.ToLower(f.MimeType)
-	if strings.Contains(mt, "geo+json") || strings.Contains(mt, "geojson") {
-		return map[string]any{"type": "object", "format": "geojson"}
+func wps1ComplexDataSchema(cd *wps1ComplexData) map[string]any {
+	schema := map[string]any{"type": "object"}
+	// Collect all MIME types: default first, then supported.
+	seen := map[string]bool{}
+	var mimeTypes []any
+	var geomFormat string
+	addFormat := func(f wps1Format) {
+		if f.MimeType != "" && !seen[f.MimeType] {
+			seen[f.MimeType] = true
+			mimeTypes = append(mimeTypes, f.MimeType)
+		}
+		if geomFormat == "" {
+			mt := strings.ToLower(f.MimeType)
+			switch {
+			case strings.Contains(mt, "geo+json") || strings.Contains(mt, "geojson"):
+				geomFormat = "geojson"
+			case strings.Contains(mt, "gml"):
+				geomFormat = "gml"
+			case strings.Contains(mt, "wkt"):
+				geomFormat = "wkt"
+			case strings.Contains(mt, "wkb"):
+				geomFormat = "wkb"
+			}
+		}
 	}
-	return map[string]any{"type": "object"}
+	addFormat(cd.Default.Format)
+	for _, f := range cd.Supported.Formats {
+		addFormat(f)
+	}
+	if geomFormat != "" {
+		schema["format"] = geomFormat
+	}
+	if len(mimeTypes) > 0 {
+		schema["contentMediaTypes"] = mimeTypes
+	}
+	return schema
 }
 
 func wps1LiteralDataSchema(ld *wps1LiteralData) map[string]any {
