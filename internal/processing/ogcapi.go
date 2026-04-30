@@ -61,6 +61,7 @@ func (c *OGCAPIClient) Execute(ctx context.Context, remote domain.RemoteConfig, 
 		return "", nil, fmt.Errorf("building execute request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Prefer", "respond-async")
 	for k, v := range remote.Headers {
 		req.Header.Set(k, v)
@@ -150,6 +151,7 @@ func (c *OGCAPIClient) fetchStatus(ctx context.Context, statusURL string, header
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Accept", "application/json")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -178,6 +180,7 @@ func (c *OGCAPIClient) fetchResults(ctx context.Context, resultsURL string, head
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Accept", "application/json")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -294,6 +297,7 @@ func (b *OGCAPIBackend) FetchProcessList(ctx context.Context, service domain.Pro
 	if err != nil {
 		return nil, fmt.Errorf("building process list request: %w", err)
 	}
+	req.Header.Set("Accept", "application/json")
 	for k, v := range service.Headers {
 		req.Header.Set(k, v)
 	}
@@ -322,6 +326,7 @@ func (b *OGCAPIBackend) DescribeProcess(ctx context.Context, service domain.Proc
 	if err != nil {
 		return nil, fmt.Errorf("building describe request for %q: %w", processID, err)
 	}
+	req.Header.Set("Accept", "application/json")
 	for k, v := range service.Headers {
 		req.Header.Set(k, v)
 	}
