@@ -162,6 +162,7 @@ func (h *Handlers) fetchAndStoreProcesses(ctx context.Context, svc *domain.Proce
 	}
 
 	processes := make(map[string]domain.ProcessConfig, len(summaries))
+	order := make([]string, 0, len(summaries))
 	for _, s := range summaries {
 		desc, err := backend.DescribeProcess(ctx, *svc, s.ID)
 		if err != nil {
@@ -175,8 +176,10 @@ func (h *Handlers) fetchAndStoreProcesses(ctx context.Context, svc *domain.Proce
 			Title:       desc.Title,
 			Description: json.RawMessage(descJSON),
 		}
+		order = append(order, s.ID)
 	}
 	svc.Processes = processes
+	svc.ProcessOrder = order
 	return nil
 }
 
@@ -263,6 +266,18 @@ func (h *Handlers) HandleUpdateProcessingService() echo.HandlerFunc {
 			}
 		}
 		updated.Processes = kept
+
+		keptSet := make(map[string]bool, len(req.Processes))
+		for _, id := range req.Processes {
+			keptSet[id] = true
+		}
+		keptOrder := make([]string, 0, len(req.Processes))
+		for _, id := range cfg.Services[idx].ProcessOrder {
+			if keptSet[id] {
+				keptOrder = append(keptOrder, id)
+			}
+		}
+		updated.ProcessOrder = keptOrder
 
 		cfg.Services[idx] = updated
 
@@ -407,7 +422,17 @@ func (h *Handlers) HandleProcessList() echo.HandlerFunc {
 		var allProcesses []ProcessSummary
 
 		for _, svc := range cfg.Services {
-			for processID, procCfg := range svc.Processes {
+			order := svc.ProcessOrder
+			if len(order) == 0 {
+				for id := range svc.Processes {
+					order = append(order, id)
+				}
+			}
+			for _, processID := range order {
+				procCfg, ok := svc.Processes[processID]
+				if !ok {
+					continue
+				}
 				prefixedID := PrefixProcessID(svc.ID, processID)
 
 				var summaryFields struct {

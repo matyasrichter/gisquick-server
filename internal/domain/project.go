@@ -229,12 +229,13 @@ type ProcessConfig struct {
 
 // ProcessingService represents a configured processing backend.
 type ProcessingService struct {
-	ID        string                   `json:"id"`
-	URL       string                   `json:"url"`
-	Type      ProcessingServiceType    `json:"type"`
-	Name      string                   `json:"name,omitempty"`
-	Headers   map[string]string        `json:"headers,omitempty"`
-	Processes map[string]ProcessConfig `json:"processes,omitempty"`
+	ID           string                   `json:"id"`
+	URL          string                   `json:"url"`
+	Type         ProcessingServiceType    `json:"type"`
+	Name         string                   `json:"name,omitempty"`
+	Headers      map[string]string        `json:"headers,omitempty"`
+	Processes    map[string]ProcessConfig `json:"processes,omitempty"`
+	ProcessOrder []string                 `json:"processOrder,omitempty"`
 }
 
 // ProcessingConfig holds the processing configuration for a project.
