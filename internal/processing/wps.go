@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,8 @@ type wpsInput struct {
 	Identifier      owsIdentifier       `xml:"http://www.opengis.net/ows/1.1 Identifier"`
 	Title           string              `xml:"http://www.opengis.net/ows/1.1 Title"`
 	Abstract        string              `xml:"http://www.opengis.net/ows/1.1 Abstract"`
+	MinOccursStr    string              `xml:"minOccurs,attr"`
+	MaxOccursStr    string              `xml:"maxOccurs,attr"`
 	LiteralData     *wpsLiteralData     `xml:"http://www.opengis.net/wps/2.0 LiteralData"`
 	ComplexData     *wpsComplexData     `xml:"http://www.opengis.net/wps/2.0 ComplexData"`
 	BoundingBoxData *wpsBoundingBoxData `xml:"http://www.opengis.net/wps/2.0 BoundingBoxData"`
@@ -159,8 +162,8 @@ type wps1Input struct {
 	Identifier      owsIdentifier        `xml:"http://www.opengis.net/ows/1.1 Identifier"`
 	Title           string               `xml:"http://www.opengis.net/ows/1.1 Title"`
 	Abstract        string               `xml:"http://www.opengis.net/ows/1.1 Abstract"`
-	MinOccurs       int                  `xml:"minOccurs,attr"`
-	MaxOccurs       int                  `xml:"maxOccurs,attr"`
+	MinOccursStr    string               `xml:"minOccurs,attr"`
+	MaxOccursStr    string               `xml:"maxOccurs,attr"`
 	LiteralData     *wps1LiteralData     `xml:"LiteralData"`
 	ComplexData     *wps1ComplexData     `xml:"ComplexData"`
 	BoundingBoxData *wps1BoundingBoxData `xml:"BoundingBoxData"`
@@ -343,6 +346,60 @@ type wps1OutputReference struct {
 // ---------------------------------------------------------------------------
 // WPSBackend
 // ---------------------------------------------------------------------------
+
+// parseWPSMinOccurs parses a WPS minOccurs XML attribute value.
+// An empty string (attribute absent) returns the spec default of 1.
+func parseWPSMinOccurs(s string) int {
+	if s == "" {
+		return 1
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 1
+	}
+	return n
+}
+
+// parseWPSMaxOccurs parses a WPS maxOccurs XML attribute value.
+// "unbounded" and an absent attribute are represented as 0 (unlimited).
+// A missing attribute (empty string) returns the spec default of 1.
+func parseWPSMaxOccurs(s string) int {
+	switch s {
+	case "unbounded":
+		return 0
+	case "":
+		return 1
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 1
+	}
+	return n
+}
+
+// extractMaxOccursFromDesc returns a map of input name → maxOccurs parsed from a
+// stored ProcessDescription JSON blob. Used by Execute builders to detect
+// multi-value inputs that must be expanded to multiple WPS Input elements.
+func extractMaxOccursFromDesc(descJSON json.RawMessage) map[string]int {
+	result := map[string]int{}
+	if len(descJSON) == 0 {
+		return result
+	}
+	var desc ProcessDescription
+	if err := json.Unmarshal(descJSON, &desc); err != nil || len(desc.Inputs) == 0 {
+		return result
+	}
+	var inputsMap map[string]struct {
+		MaxOccurs int `json:"maxOccurs"`
+	}
+	if err := json.Unmarshal(desc.Inputs, &inputsMap); err != nil {
+		return result
+	}
+	for id, inp := range inputsMap {
+		result[id] = inp.MaxOccurs
+	}
+	return result
+}
 
 // WPSBackend implements ProcessingBackend for OGC WPS services (versions 1.x and 2.x).
 type WPSBackend struct {
@@ -734,7 +791,7 @@ func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain
 	if major == 1 {
 		return b.executeWPS1(ctx, job, service, inputs, mode, descJSON)
 	}
-	return b.executeWPS2(ctx, job, service, inputs, mode)
+	return b.executeWPS2(ctx, job, service, inputs, mode, descJSON)
 }
 
 // executeWPS1 handles the WPS 1.0 Execute path: builds the XML request,
@@ -743,7 +800,7 @@ func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain
 func (b *WPSBackend) executeWPS1(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, mode string, descJSON json.RawMessage) ([]OutputResult, string, error) {
 	outputIDs := wps1OutputIDs(descJSON)
 
-	xmlBody, err := b.buildWPS1ExecuteXML(job.ProcessID, mode, inputs, outputIDs)
+	xmlBody, err := b.buildWPS1ExecuteXML(job.ProcessID, mode, inputs, outputIDs, descJSON)
 	if err != nil {
 		return nil, "", fmt.Errorf("building WPS 1.0 Execute XML: %w", err)
 	}
@@ -802,8 +859,8 @@ func (b *WPSBackend) executeWPS1(ctx context.Context, job *JobRecord, service do
 // executeWPS2 handles the WPS 2.0.2 Execute path: builds the XML request,
 // POSTs it, and either parses an inline Result (sync) or polls GetStatus until
 // the job succeeds or fails, then fetches GetResult.
-func (b *WPSBackend) executeWPS2(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, mode string) ([]OutputResult, string, error) {
-	xmlBody, err := b.buildExecuteXML(job.ProcessID, mode, inputs)
+func (b *WPSBackend) executeWPS2(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, mode string, descJSON json.RawMessage) ([]OutputResult, string, error) {
+	xmlBody, err := b.buildExecuteXML(job.ProcessID, mode, inputs, descJSON)
 	if err != nil {
 		return nil, "", fmt.Errorf("building WPS Execute XML: %w", err)
 	}
@@ -982,8 +1039,10 @@ func (b *WPSBackend) wps1PollAndFetch(ctx context.Context, service domain.Proces
 }
 
 // buildExecuteXML marshals a WPS 2.0.2 Execute request body from the OGC API
-// JSON inputs document.
-func (b *WPSBackend) buildExecuteXML(processID, mode string, inputs json.RawMessage) ([]byte, error) {
+// JSON inputs document. descJSON is the stored process description used to
+// detect multi-value inputs (maxOccurs != 1) that must expand to multiple
+// Input elements rather than being encoded as a single JSON array.
+func (b *WPSBackend) buildExecuteXML(processID, mode string, inputs json.RawMessage, descJSON json.RawMessage) ([]byte, error) {
 	// Parse the OGC API inputs map.
 	var wrapper struct {
 		Inputs map[string]json.RawMessage `json:"inputs"`
@@ -992,14 +1051,16 @@ func (b *WPSBackend) buildExecuteXML(processID, mode string, inputs json.RawMess
 		return nil, fmt.Errorf("parsing inputs JSON: %w", err)
 	}
 
+	maxOccursMap := extractMaxOccursFromDesc(descJSON)
+
 	// Translate each input.
 	var inputElems []wpsInputElement
 	for id, rawVal := range wrapper.Inputs {
-		elem, err := buildWPSInputElement(id, rawVal)
+		elems, err := buildWPSInputElements(id, rawVal, maxOccursMap[id])
 		if err != nil {
 			return nil, fmt.Errorf("translating input %q: %w", id, err)
 		}
-		inputElems = append(inputElems, elem)
+		inputElems = append(inputElems, elems...)
 	}
 
 	exec := wpsExecuteRequest{
@@ -1019,6 +1080,36 @@ func (b *WPSBackend) buildExecuteXML(processID, mode string, inputs json.RawMess
 		return nil, err
 	}
 	return append([]byte(xml.Header), out...), nil
+}
+
+// buildWPSInputElements converts an OGC API JSON input value to one or more
+// wpsInputElement values. When maxOccurs != 1 and the value is a JSON array
+// (that is not a bounding box), each array item becomes a separate element
+// with the same id, matching WPS multi-value semantics.
+func buildWPSInputElements(id string, raw json.RawMessage, maxOccurs int) ([]wpsInputElement, error) {
+	if maxOccurs != 1 {
+		var arr []json.RawMessage
+		if json.Unmarshal(raw, &arr) == nil {
+			// Confirm it is not a bounding-box array of numbers.
+			var vals []any
+			if json.Unmarshal(raw, &vals) == nil && !isBBoxArray(vals) {
+				elems := make([]wpsInputElement, 0, len(arr))
+				for _, item := range arr {
+					elem, err := buildWPSInputElement(id, item)
+					if err != nil {
+						return nil, err
+					}
+					elems = append(elems, elem)
+				}
+				return elems, nil
+			}
+		}
+	}
+	elem, err := buildWPSInputElement(id, raw)
+	if err != nil {
+		return nil, err
+	}
+	return []wpsInputElement{elem}, nil
 }
 
 // buildWPSInputElement converts a single OGC API JSON input value to a
@@ -1278,6 +1369,14 @@ func wpsInputToOGCAPI(inp wpsInput) map[string]any {
 	if inp.Abstract != "" {
 		entry["description"] = inp.Abstract
 	}
+	minOccurs := parseWPSMinOccurs(inp.MinOccursStr)
+	maxOccurs := parseWPSMaxOccurs(inp.MaxOccursStr)
+	if minOccurs != 1 {
+		entry["minOccurs"] = minOccurs
+	}
+	if maxOccurs != 1 {
+		entry["maxOccurs"] = maxOccurs
+	}
 	return entry
 }
 
@@ -1413,6 +1512,14 @@ func wps1InputToOGCAPI(inp wps1Input) map[string]any {
 	if inp.Abstract != "" {
 		entry["description"] = inp.Abstract
 	}
+	minOccurs := parseWPSMinOccurs(inp.MinOccursStr)
+	maxOccurs := parseWPSMaxOccurs(inp.MaxOccursStr)
+	if minOccurs != 1 {
+		entry["minOccurs"] = minOccurs
+	}
+	if maxOccurs != 1 {
+		entry["maxOccurs"] = maxOccurs
+	}
 	return entry
 }
 
@@ -1517,7 +1624,8 @@ func wps1LiteralOutputSchema(lo *wps1LiteralOutput) map[string]any {
 
 // buildWPS1ExecuteXML marshals a WPS 1.0 Execute request from OGC API JSON inputs.
 // outputIDs must list the expected output identifiers (required by WPS 1.0 ResponseDocument).
-func (b *WPSBackend) buildWPS1ExecuteXML(processID, mode string, inputs json.RawMessage, outputIDs []string) ([]byte, error) {
+// descJSON is the stored process description used to detect multi-value inputs.
+func (b *WPSBackend) buildWPS1ExecuteXML(processID, mode string, inputs json.RawMessage, outputIDs []string, descJSON json.RawMessage) ([]byte, error) {
 	var wrapper struct {
 		Inputs map[string]json.RawMessage `json:"inputs"`
 	}
@@ -1525,13 +1633,15 @@ func (b *WPSBackend) buildWPS1ExecuteXML(processID, mode string, inputs json.Raw
 		return nil, fmt.Errorf("parsing inputs JSON: %w", err)
 	}
 
+	maxOccursMap := extractMaxOccursFromDesc(descJSON)
+
 	var inputElems []wps1InputElem
 	for id, rawVal := range wrapper.Inputs {
-		elem, err := buildWPS1InputElement(id, rawVal)
+		elems, err := buildWPS1InputElements(id, rawVal, maxOccursMap[id])
 		if err != nil {
 			return nil, fmt.Errorf("translating input %q: %w", id, err)
 		}
-		inputElems = append(inputElems, elem)
+		inputElems = append(inputElems, elems...)
 	}
 
 	outputReqs := make([]wps1OutputReq, 0, len(outputIDs))
@@ -1568,6 +1678,33 @@ func (b *WPSBackend) buildWPS1ExecuteXML(processID, mode string, inputs json.Raw
 		return nil, err
 	}
 	return append([]byte(xml.Header), out...), nil
+}
+
+// buildWPS1InputElements converts an OGC API JSON input value to one or more
+// wps1InputElem values, expanding arrays to multiple elements when maxOccurs != 1.
+func buildWPS1InputElements(id string, raw json.RawMessage, maxOccurs int) ([]wps1InputElem, error) {
+	if maxOccurs != 1 {
+		var arr []json.RawMessage
+		if json.Unmarshal(raw, &arr) == nil {
+			var vals []any
+			if json.Unmarshal(raw, &vals) == nil && !isBBoxArray(vals) {
+				elems := make([]wps1InputElem, 0, len(arr))
+				for _, item := range arr {
+					elem, err := buildWPS1InputElement(id, item)
+					if err != nil {
+						return nil, err
+					}
+					elems = append(elems, elem)
+				}
+				return elems, nil
+			}
+		}
+	}
+	elem, err := buildWPS1InputElement(id, raw)
+	if err != nil {
+		return nil, err
+	}
+	return []wps1InputElem{elem}, nil
 }
 
 // buildWPS1InputElement converts a single OGC API JSON input value to wps1InputElem.

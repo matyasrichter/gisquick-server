@@ -307,7 +307,8 @@ func (b *OGCAPIBackend) FetchProcessList(ctx context.Context, service domain.Pro
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("process list returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("process list returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var list ProcessList
@@ -336,7 +337,8 @@ func (b *OGCAPIBackend) DescribeProcess(ctx context.Context, service domain.Proc
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("process description for %q returned status %d", processID, resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("process description for %q returned status %d: %s", processID, resp.StatusCode, string(body))
 	}
 
 	raw, err := io.ReadAll(resp.Body)

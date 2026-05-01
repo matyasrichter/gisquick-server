@@ -494,7 +494,7 @@ func TestLiteralDataType(t *testing.T) {
 
 func TestWPS1FetchProcessList(t *testing.T) {
 	capsXML := `<?xml version="1.0" encoding="UTF-8"?>
-<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
+<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
     xmlns:ows="http://www.opengis.net/ows/1.1"
     version="1.0.0" service="WPS">
   <wps:ProcessOfferings>
@@ -510,7 +510,7 @@ func TestWPS1FetchProcessList(t *testing.T) {
       <ows:Abstract></ows:Abstract>
     </wps:Process>
   </wps:ProcessOfferings>
-</wps:WPS_Capabilities>`
+</wps:Capabilities>`
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
@@ -538,12 +538,12 @@ func TestWPS1FetchProcessList(t *testing.T) {
 
 func TestWPS1DescribeProcess(t *testing.T) {
 	capsXML := `<?xml version="1.0"?>
-<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
+<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
     xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
   <wps:ProcessOfferings>
     <wps:Process><ows:Identifier>buffer</ows:Identifier><ows:Title>Buffer</ows:Title></wps:Process>
   </wps:ProcessOfferings>
-</wps:WPS_Capabilities>`
+</wps:Capabilities>`
 
 	describeXML := `<?xml version="1.0"?>
 <wps:ProcessDescriptions xmlns:wps="http://www.opengis.net/wps/1.0.0"
@@ -654,12 +654,12 @@ func TestWPSDetectVersion(t *testing.T) {
 		},
 		{
 			name:      "wps 1.0.0",
-			body:      `<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0" version="1.0.0" service="WPS"></wps:WPS_Capabilities>`,
+			body:      `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0" version="1.0.0" service="WPS"></wps:Capabilities>`,
 			wantMajor: 1,
 		},
 		{
 			name:      "wps 1.3.0",
-			body:      `<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0" version="1.3.0" service="WPS"></wps:WPS_Capabilities>`,
+			body:      `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0" version="1.3.0" service="WPS"></wps:Capabilities>`,
 			wantMajor: 1,
 		},
 	}
@@ -677,12 +677,12 @@ func TestWPSDetectVersion(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestWPS1ExecuteAsync(t *testing.T) {
-	capsXML := `<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
+	capsXML := `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
       xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
     <wps:ProcessOfferings>
       <wps:Process><ows:Identifier>buffer</ows:Identifier><ows:Title>Buffer</ows:Title></wps:Process>
     </wps:ProcessOfferings>
-  </wps:WPS_Capabilities>`
+  </wps:Capabilities>`
 
 	acceptedXML := `<wps:ExecuteResponse xmlns:wps="http://www.opengis.net/wps/1.0.0"
       xmlns:ows="http://www.opengis.net/ows/1.1"
@@ -765,12 +765,12 @@ func TestWPS1ExecuteAsync(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestWPS1ExecuteSync(t *testing.T) {
-	capsXML := `<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
+	capsXML := `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
       xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
     <wps:ProcessOfferings>
       <wps:Process><ows:Identifier>info</ows:Identifier><ows:Title>Info</ows:Title></wps:Process>
     </wps:ProcessOfferings>
-  </wps:WPS_Capabilities>`
+  </wps:Capabilities>`
 
 	syncResultXML := `<wps:ExecuteResponse xmlns:wps="http://www.opengis.net/wps/1.0.0"
       xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
@@ -823,12 +823,12 @@ func TestWPS1ExecuteSync(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestWPS1ExecuteFailure(t *testing.T) {
-	capsXML := `<wps:WPS_Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
+	capsXML := `<wps:Capabilities xmlns:wps="http://www.opengis.net/wps/1.0.0"
       xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0" service="WPS">
     <wps:ProcessOfferings>
       <wps:Process><ows:Identifier>proc</ows:Identifier><ows:Title>P</ows:Title></wps:Process>
     </wps:ProcessOfferings>
-  </wps:WPS_Capabilities>`
+  </wps:Capabilities>`
 
 	acceptedXML := `<wps:ExecuteResponse xmlns:wps="http://www.opengis.net/wps/1.0.0"
       xmlns:ows="http://www.opengis.net/ows/1.1" statusLocation="STATUS_LOCATION_URL">
