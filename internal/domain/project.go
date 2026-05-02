@@ -221,10 +221,17 @@ type RemoteConfig struct {
 	Headers    map[string]string `json:"headers,omitempty"`
 }
 
+// InputFormat holds the accepted media types for a single process input,
+// in declaration order from the process description.
+type InputFormat struct {
+	AcceptedMediaTypes []string `json:"accepted_media_types,omitempty"`
+}
+
 // ProcessConfig holds the stored description for a specific process.
 type ProcessConfig struct {
-	Title       string          `json:"title,omitempty"`
-	Description json.RawMessage `json:"description,omitempty"` // full OGC API process description, stored at registration time
+	Title        string                   `json:"title,omitempty"`
+	Description  json.RawMessage          `json:"description,omitempty"` // full OGC API process description, stored at registration time
+	InputFormats map[string]InputFormat   `json:"input_formats,omitempty"`
 }
 
 // ProcessingService represents a configured processing backend.

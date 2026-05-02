@@ -173,8 +173,9 @@ func (h *Handlers) fetchAndStoreProcesses(ctx context.Context, svc *domain.Proce
 			return fmt.Errorf("marshaling process description for %q: %w", s.ID, err)
 		}
 		processes[s.ID] = domain.ProcessConfig{
-			Title:       desc.Title,
-			Description: json.RawMessage(descJSON),
+			Title:        desc.Title,
+			Description:  json.RawMessage(descJSON),
+			InputFormats: extractInputFormats(json.RawMessage(descJSON)),
 		}
 		order = append(order, s.ID)
 	}

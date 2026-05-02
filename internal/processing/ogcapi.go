@@ -359,6 +359,14 @@ func (b *OGCAPIBackend) DescribeProcess(ctx context.Context, service domain.Proc
 // The job parameter is present for interface compatibility; the backend does
 // not mutate it — mutation is the caller's responsibility.
 func (b *OGCAPIBackend) Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage) ([]OutputResult, string, error) {
+	if procCfg, ok := service.Processes[job.ProcessID]; ok && len(procCfg.InputFormats) > 0 {
+		converted, err := transformInputs(inputs, procCfg.InputFormats, defaultRegistry)
+		if err != nil {
+			return nil, "", fmt.Errorf("converting inputs: %w", err)
+		}
+		inputs = converted
+	}
+
 	remote := domain.RemoteConfig{
 		ExecuteURL: strings.TrimRight(service.URL, "/") + "/processes/" + job.ProcessID + "/execution",
 		Type:       string(service.Type),

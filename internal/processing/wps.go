@@ -303,7 +303,7 @@ type wps1ProcessStarted struct {
 }
 
 type wps1ProcessFailed struct {
-	ExceptionReport wps1ExceptionReport `xml:"http://www.opengis.net/ows/1.1 ExceptionReport"`
+	ExceptionReport wps1ExceptionReport `xml:"ExceptionReport"`
 }
 
 type wps1ExceptionReport struct {
@@ -472,8 +472,27 @@ type wpsExecLiteralData struct {
 }
 
 type wpsExecComplexData struct {
-	MimeType string `xml:"mimeType,attr"`
-	Value    string `xml:",chardata"`
+	MimeType string
+	Value    string
+	asCDATA  bool
+}
+
+func (c *wpsExecComplexData) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	start.Attr = append(start.Attr, xml.Attr{
+		Name:  xml.Name{Local: "mimeType"},
+		Value: c.MimeType,
+	})
+	if c.asCDATA {
+		// ",innerxml" writes the string verbatim — no escaping — so we can embed a CDATA section.
+		type inner struct {
+			Raw string `xml:",innerxml"`
+		}
+		return e.EncodeElement(inner{Raw: "<![CDATA[" + c.Value + "]]>"}, start)
+	}
+	type chardata struct {
+		Value string `xml:",chardata"`
+	}
+	return e.EncodeElement(chardata{Value: c.Value}, start)
 }
 
 type wpsExecBoundingBox struct {
@@ -780,6 +799,14 @@ func (b *WPSBackend) DescribeProcess(ctx context.Context, service domain.Process
 // waits for completion (polling for async, or parsing inline for sync), and
 // returns the output results together with the remote job ID.
 func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage) ([]OutputResult, string, error) {
+	if procCfg, ok := service.Processes[job.ProcessID]; ok && len(procCfg.InputFormats) > 0 {
+		converted, err := transformInputs(inputs, procCfg.InputFormats, defaultRegistry)
+		if err != nil {
+			return nil, "", fmt.Errorf("converting inputs: %w", err)
+		}
+		inputs = converted
+	}
+
 	// Determine execution mode from stored process description.
 	mode := "async" // default
 	var descJSON json.RawMessage
@@ -1045,6 +1072,9 @@ func (b *WPSBackend) wps1PollAndFetch(ctx context.Context, service domain.Proces
 		case execResp.Status.ProcessFailed != nil:
 			msg := execResp.Status.ProcessFailed.ExceptionReport.Exception.ExceptionText
 			if msg == "" {
+				msg = string(body)
+			}
+			if msg == "" {
 				msg = "unknown failure"
 			}
 			return nil, fmt.Errorf("WPS 1.0 job failed: %s", msg)
@@ -1185,10 +1215,16 @@ func buildWPSInputElement(id string, raw json.RawMessage) (wpsInputElement, erro
 		}
 
 	default:
-		// Scalar (string, number, boolean) → LiteralData.
+		// Scalar (string, number, boolean) → LiteralData; XML strings → ComplexData.
 		var s string
 		switch tv := v.(type) {
 		case string:
+			if trimmed := strings.TrimSpace(tv); len(trimmed) > 0 && trimmed[0] == '<' {
+				elem.Data = wpsDataElem{
+					ComplexData: &wpsExecComplexData{MimeType: "application/gml+xml", Value: tv, asCDATA: true},
+				}
+				return elem, nil
+			}
 			s = tv
 		case float64:
 			s = fmt.Sprintf("%g", tv)
@@ -1768,6 +1804,12 @@ func buildWPS1InputElement(id string, raw json.RawMessage) (wps1InputElem, error
 		var s string
 		switch tv := v.(type) {
 		case string:
+			if trimmed := strings.TrimSpace(tv); len(trimmed) > 0 && trimmed[0] == '<' {
+				elem.Data = wps1DataElem{
+					ComplexData: &wpsExecComplexData{MimeType: "application/gml+xml", Value: tv, asCDATA: true},
+				}
+				return elem, nil
+			}
 			s = tv
 		case float64:
 			s = fmt.Sprintf("%g", tv)

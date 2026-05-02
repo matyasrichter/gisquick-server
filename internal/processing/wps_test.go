@@ -3,6 +3,7 @@ package processing
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -880,4 +881,296 @@ func TestWPS1ExecuteFailure(t *testing.T) {
 	_, _, err := backend.Execute(context.Background(), &JobRecord{ProcessID: "proc"}, service, json.RawMessage(`{"inputs":{}}`))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "out of memory")
+}
+
+// ---------------------------------------------------------------------------
+// Helpers: minimal XML structs for asserting on buildWPS1ExecuteXML output
+// ---------------------------------------------------------------------------
+
+type testWPS1Exec struct {
+	XMLName      xml.Name         `xml:"Execute"`
+	Version      string           `xml:"version,attr"`
+	Service      string           `xml:"service,attr"`
+	Identifier   string           `xml:"http://www.opengis.net/ows/1.1 Identifier"`
+	DataInputs   testWPS1Inputs   `xml:"DataInputs"`
+	ResponseForm testWPS1RespForm `xml:"ResponseForm"`
+}
+
+type testWPS1Inputs struct {
+	Inputs []testWPS1Input `xml:"Input"`
+}
+
+type testWPS1Input struct {
+	Identifier  string               `xml:"http://www.opengis.net/ows/1.1 Identifier"`
+	LiteralData string               `xml:"Data>LiteralData"`
+	ComplexData *testWPS1ComplexData `xml:"Data>ComplexData"`
+	BBoxLower   string               `xml:"Data>BoundingBoxData>http://www.opengis.net/ows/1.1 LowerCorner"`
+	BBoxUpper   string               `xml:"Data>BoundingBoxData>http://www.opengis.net/ows/1.1 UpperCorner"`
+}
+
+type testWPS1ComplexData struct {
+	MimeType string `xml:"mimeType,attr"`
+	Value    string `xml:",chardata"`
+}
+
+type testWPS1RespForm struct {
+	ResponseDoc *testWPS1RespDoc `xml:"ResponseDocument"`
+}
+
+type testWPS1RespDoc struct {
+	Status               string           `xml:"status,attr"`
+	StoreExecuteResponse string           `xml:"storeExecuteResponse,attr"`
+	Outputs              []testWPS1OutReq `xml:"Output"`
+}
+
+type testWPS1OutReq struct {
+	AsReference string `xml:"asReference,attr"`
+	Identifier  string `xml:"http://www.opengis.net/ows/1.1 Identifier"`
+}
+
+func parseWPS1ExecXML(t *testing.T, xmlBytes []byte) testWPS1Exec {
+	t.Helper()
+	var exec testWPS1Exec
+	require.NoError(t, xml.Unmarshal(xmlBytes, &exec), "parsing generated WPS 1.0 Execute XML")
+	return exec
+}
+
+func newTestWPSBackend() *WPSBackend {
+	return &WPSBackend{client: &http.Client{}, log: zap.NewNop().Sugar()}
+}
+
+func makeDescJSON(t *testing.T, maxOccursMap map[string]int) json.RawMessage {
+	t.Helper()
+	inputs := make(map[string]any, len(maxOccursMap))
+	for id, mo := range maxOccursMap {
+		inputs[id] = map[string]any{"maxOccurs": mo}
+	}
+	b, err := json.Marshal(ProcessDescription{
+		Inputs: mustMarshalJSON(t, inputs),
+	})
+	require.NoError(t, err)
+	return b
+}
+
+func mustMarshalJSON(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return b
+}
+
+// ---------------------------------------------------------------------------
+// buildWPS1ExecuteXML — multi-value literal expansion (soil-texture-hsg layers)
+// ---------------------------------------------------------------------------
+
+func TestBuildWPS1ExecuteXML_MultiValueLiteralExpansion(t *testing.T) {
+	b := newTestWPSBackend()
+	descJSON := makeDescJSON(t, map[string]int{"layers": 5})
+	inputs := json.RawMessage(`{"inputs":{"layers":["sand","silt","clay","usda-texture-class"]}}`)
+
+	xmlBytes, err := b.buildWPS1ExecuteXML("soil-texture-hsg", "async", inputs, []string{"output"}, descJSON)
+	require.NoError(t, err)
+
+	exec := parseWPS1ExecXML(t, xmlBytes)
+	assert.Equal(t, "soil-texture-hsg", exec.Identifier)
+
+	var layerInputs []testWPS1Input
+	for _, inp := range exec.DataInputs.Inputs {
+		if inp.Identifier == "layers" {
+			layerInputs = append(layerInputs, inp)
+		}
+	}
+	require.Len(t, layerInputs, 4, "expected 4 expanded Input elements for layers")
+	assert.Equal(t, "sand", layerInputs[0].LiteralData)
+	assert.Equal(t, "silt", layerInputs[1].LiteralData)
+	assert.Equal(t, "clay", layerInputs[2].LiteralData)
+	assert.Equal(t, "usda-texture-class", layerInputs[3].LiteralData)
+}
+
+// ---------------------------------------------------------------------------
+// buildWPS1ExecuteXML — scalar literal types (string, number, bool)
+// ---------------------------------------------------------------------------
+
+func TestBuildWPS1ExecuteXML_ScalarLiteralTypes(t *testing.T) {
+	b := newTestWPSBackend()
+	inputs := json.RawMessage(`{"inputs":{"name":"test","count":42.5,"enabled":true}}`)
+
+	xmlBytes, err := b.buildWPS1ExecuteXML("proc", "sync", inputs, []string{"result"}, nil)
+	require.NoError(t, err)
+
+	exec := parseWPS1ExecXML(t, xmlBytes)
+
+	byID := make(map[string]testWPS1Input, len(exec.DataInputs.Inputs))
+	for _, inp := range exec.DataInputs.Inputs {
+		byID[inp.Identifier] = inp
+	}
+
+	assert.Equal(t, "test", byID["name"].LiteralData)
+	assert.Equal(t, "42.5", byID["count"].LiteralData)
+	assert.Equal(t, "true", byID["enabled"].LiteralData)
+}
+
+// ---------------------------------------------------------------------------
+// buildWPS1ExecuteXML — GeoJSON object input → ComplexData geo+json
+// ---------------------------------------------------------------------------
+
+func TestBuildWPS1ExecuteXML_ComplexDataGeoJSON(t *testing.T) {
+	b := newTestWPSBackend()
+	inputs := json.RawMessage(`{"inputs":{"features":{"type":"FeatureCollection","features":[]}}}`)
+
+	xmlBytes, err := b.buildWPS1ExecuteXML("proc", "sync", inputs, []string{"result"}, nil)
+	require.NoError(t, err)
+
+	exec := parseWPS1ExecXML(t, xmlBytes)
+	require.Len(t, exec.DataInputs.Inputs, 1)
+
+	inp := exec.DataInputs.Inputs[0]
+	assert.Equal(t, "features", inp.Identifier)
+	require.NotNil(t, inp.ComplexData)
+	assert.Equal(t, "application/geo+json", inp.ComplexData.MimeType)
+	assert.Contains(t, inp.ComplexData.Value, "FeatureCollection")
+}
+
+// ---------------------------------------------------------------------------
+// buildWPS1ExecuteXML — async ResponseDocument
+// ---------------------------------------------------------------------------
+
+func TestBuildWPS1ExecuteXML_AsyncResponseDocument(t *testing.T) {
+	b := newTestWPSBackend()
+	inputs := json.RawMessage(`{"inputs":{}}`)
+
+	xmlBytes, err := b.buildWPS1ExecuteXML("d-rain6h-timedist", "async", inputs, []string{"output", "output_shapes"}, nil)
+	require.NoError(t, err)
+
+	exec := parseWPS1ExecXML(t, xmlBytes)
+	require.NotNil(t, exec.ResponseForm.ResponseDoc)
+	rd := exec.ResponseForm.ResponseDoc
+	assert.Equal(t, "true", rd.Status)
+	assert.Equal(t, "true", rd.StoreExecuteResponse)
+	require.Len(t, rd.Outputs, 2)
+	assert.Equal(t, "output", rd.Outputs[0].Identifier)
+	assert.Equal(t, "false", rd.Outputs[0].AsReference)
+	assert.Equal(t, "output_shapes", rd.Outputs[1].Identifier)
+}
+
+// ---------------------------------------------------------------------------
+// buildWPS1ExecuteXML — sync ResponseDocument
+// ---------------------------------------------------------------------------
+
+func TestBuildWPS1ExecuteXML_SyncResponseDocument(t *testing.T) {
+	b := newTestWPSBackend()
+	inputs := json.RawMessage(`{"inputs":{}}`)
+
+	xmlBytes, err := b.buildWPS1ExecuteXML("proc", "sync", inputs, []string{"result"}, nil)
+	require.NoError(t, err)
+
+	exec := parseWPS1ExecXML(t, xmlBytes)
+	require.NotNil(t, exec.ResponseForm.ResponseDoc)
+	rd := exec.ResponseForm.ResponseDoc
+	assert.Equal(t, "false", rd.Status)
+	assert.Equal(t, "false", rd.StoreExecuteResponse)
+	require.Len(t, rd.Outputs, 1)
+	assert.Equal(t, "result", rd.Outputs[0].Identifier)
+}
+
+// ---------------------------------------------------------------------------
+// buildWPS1ExecuteXML — mixed inputs (d-rain6h-timedist pattern)
+// ---------------------------------------------------------------------------
+
+func TestBuildWPS1ExecuteXML_MixedInputs(t *testing.T) {
+	b := newTestWPSBackend()
+	descJSON := makeDescJSON(t, map[string]int{"return_period": 6})
+	inputs := json.RawMessage(`{"inputs":{"input":{"type":"FeatureCollection","features":[]},"keycolumn":"ID","return_period":["N2","N5","N10"]}}`)
+
+	xmlBytes, err := b.buildWPS1ExecuteXML("d-rain6h-timedist", "async", inputs, []string{"output"}, descJSON)
+	require.NoError(t, err)
+
+	exec := parseWPS1ExecXML(t, xmlBytes)
+
+	byID := make(map[string][]testWPS1Input)
+	for _, inp := range exec.DataInputs.Inputs {
+		byID[inp.Identifier] = append(byID[inp.Identifier], inp)
+	}
+
+	require.Len(t, byID["input"], 1)
+	require.NotNil(t, byID["input"][0].ComplexData)
+	assert.Equal(t, "application/geo+json", byID["input"][0].ComplexData.MimeType)
+
+	require.Len(t, byID["keycolumn"], 1)
+	assert.Equal(t, "ID", byID["keycolumn"][0].LiteralData)
+
+	require.Len(t, byID["return_period"], 3)
+	assert.Equal(t, "N2", byID["return_period"][0].LiteralData)
+	assert.Equal(t, "N5", byID["return_period"][1].LiteralData)
+	assert.Equal(t, "N10", byID["return_period"][2].LiteralData)
+}
+
+// ---------------------------------------------------------------------------
+// buildWPS1InputElement — bounding box
+// ---------------------------------------------------------------------------
+
+func TestBuildWPS1InputElement_BoundingBox(t *testing.T) {
+	elem, err := buildWPS1InputElement("bbox", json.RawMessage(`[10.0,50.0,11.0,51.0]`))
+	require.NoError(t, err)
+	require.NotNil(t, elem.Data.BoundingBox)
+	assert.Equal(t, "EPSG:4326", elem.Data.BoundingBox.CRS)
+	assert.Equal(t, "10 50", elem.Data.BoundingBox.LowerCorner)
+	assert.Equal(t, "11 51", elem.Data.BoundingBox.UpperCorner)
+}
+
+// ---------------------------------------------------------------------------
+// buildWPS1ExecuteXML — GML string input → ComplexData text/xml
+// (mirrors a real d-rain6h-timedist call via the RAIN WPS service)
+// ---------------------------------------------------------------------------
+
+func TestBuildWPS1ExecuteXML_GMLStringInput(t *testing.T) {
+	const gmlPolygon = `<geom xmlns="http://www.opengis.net/gml"><Polygon><exterior><LinearRing><posList srsDimension="2">9.261999 46.811357 9.262033 46.811517 9.262198 46.81179 9.262473 46.812072 9.2627 46.812317 9.26237 46.812576 9.262143 46.813259 9.260348 46.813127 9.260245 46.811729 9.261442 46.81171 9.261999 46.811357</posList></LinearRing></exterior></Polygon></geom>`
+
+	b := newTestWPSBackend()
+	descJSON := makeDescJSON(t, map[string]int{"return_period": 6, "type": 6})
+
+	inputsJSON, err := json.Marshal(map[string]any{
+		"inputs": map[string]any{
+			"input":         gmlPolygon,
+			"keycolumn":     "fid",
+			"return_period": []string{"N2", "N5", "N10"},
+			"type":          []string{"D"},
+			"area_red":      false,
+		},
+	})
+	require.NoError(t, err)
+
+	xmlBytes, err := b.buildWPS1ExecuteXML("d-rain6h-timedist", "async", json.RawMessage(inputsJSON), []string{"output", "output_shapes"}, descJSON)
+	require.NoError(t, err)
+
+	exec := parseWPS1ExecXML(t, xmlBytes)
+
+	byID := make(map[string][]testWPS1Input)
+	for _, inp := range exec.DataInputs.Inputs {
+		byID[inp.Identifier] = append(byID[inp.Identifier], inp)
+	}
+
+	// GML string → ComplexData with application/gml+xml
+	require.Len(t, byID["input"], 1)
+	require.NotNil(t, byID["input"][0].ComplexData, "expected ComplexData for GML string, got LiteralData")
+	assert.Equal(t, "application/gml+xml", byID["input"][0].ComplexData.MimeType)
+	assert.Contains(t, byID["input"][0].ComplexData.Value, "Polygon")
+
+	// Plain string → LiteralData
+	require.Len(t, byID["keycolumn"], 1)
+	assert.Equal(t, "fid", byID["keycolumn"][0].LiteralData)
+
+	// Boolean → LiteralData "false"
+	require.Len(t, byID["area_red"], 1)
+	assert.Equal(t, "false", byID["area_red"][0].LiteralData)
+
+	// Multi-value return_period → 3 separate Input elements
+	require.Len(t, byID["return_period"], 3)
+	assert.Equal(t, "N2", byID["return_period"][0].LiteralData)
+	assert.Equal(t, "N5", byID["return_period"][1].LiteralData)
+	assert.Equal(t, "N10", byID["return_period"][2].LiteralData)
+
+	// Multi-value type → 1 Input element
+	require.Len(t, byID["type"], 1)
+	assert.Equal(t, "D", byID["type"][0].LiteralData)
 }

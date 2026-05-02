@@ -17,18 +17,19 @@ RUN gcc -O3 -DSQLITE_OMIT_LOAD_EXTENSION dbhash.c sqlite3.c -lpthread -lm -o /us
 # RUN gcc -O3 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION dbhash.c sqlite3.c -lm -o /usr/local/bin/dbhash
 
 
-FROM golang:1.18-alpine as build
-RUN apk add --no-cache git
+FROM golang:1.23-alpine as build
+RUN apk add --no-cache git gcc musl-dev gdal-dev
 WORKDIR /go/src/app
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /go/bin/gisquick cmd/main.go
+RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o /go/bin/gisquick cmd/main.go
 
 
 FROM alpine:latest
+RUN apk add --no-cache gdal
 
 ENV USERNAME=app
 ENV GROUP=app

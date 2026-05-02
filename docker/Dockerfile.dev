@@ -15,15 +15,15 @@ WORKDIR /src/
 RUN gcc -O3 -DSQLITE_OMIT_LOAD_EXTENSION dbhash.c sqlite3.c -lpthread -lm -o /usr/local/bin/dbhash
 # RUN gcc -O3 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION dbhash.c sqlite3.c -lm -o /usr/local/bin/dbhash
 
-FROM golang:1.18-alpine
+FROM golang:1.23-alpine
 
 ENV USERNAME=app
 ENV GROUP=app
 ENV UID=1000
 ENV GID=1000
 
-ENV CGO_ENABLED=0
-RUN apk add --no-cache git
+ENV CGO_ENABLED=1
+RUN apk add --no-cache git gcc musl-dev gdal-dev
 
 COPY --from=dbhash-build /usr/local/bin/dbhash /usr/local/bin/
 
