@@ -401,6 +401,32 @@ func extractMaxOccursFromDesc(descJSON json.RawMessage) map[string]int {
 	return result
 }
 
+// marshalOrderedObject builds a JSON object whose keys appear in the order given
+// by items, avoiding the alphabetical sorting that encoding/json applies to Go maps.
+func marshalOrderedObject[T any](items []T, entry func(T) (string, any)) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, item := range items {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		k, v := entry(item)
+		key, err := json.Marshal(k)
+		if err != nil {
+			return nil, err
+		}
+		val, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(key)
+		buf.WriteByte(':')
+		buf.Write(val)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
+
 // WPSBackend implements ProcessingBackend for OGC WPS services (versions 1.x and 2.x).
 type WPSBackend struct {
 	client       *http.Client
@@ -725,23 +751,16 @@ func (b *WPSBackend) DescribeProcess(ctx context.Context, service domain.Process
 		jco = strings.Fields(offering.JobControlOptions)
 	}
 
-	// Translate inputs.
-	inputsMap := make(map[string]any, len(offering.Process.Inputs))
-	for _, inp := range offering.Process.Inputs {
-		inputsMap[inp.Identifier.Value] = wpsInputToOGCAPI(inp)
-	}
-
-	// Translate outputs.
-	outputsMap := make(map[string]any, len(offering.Process.Outputs))
-	for _, out := range offering.Process.Outputs {
-		outputsMap[out.Identifier.Value] = wpsOutputToOGCAPI(out)
-	}
-
-	inputsJSON, err := json.Marshal(inputsMap)
+	// Translate inputs, preserving the declaration order from the WPS response.
+	inputsJSON, err := marshalOrderedObject(offering.Process.Inputs,
+		func(inp wpsInput) (string, any) { return inp.Identifier.Value, wpsInputToOGCAPI(inp) })
 	if err != nil {
 		return nil, fmt.Errorf("encoding inputs schema: %w", err)
 	}
-	outputsJSON, err := json.Marshal(outputsMap)
+
+	// Translate outputs, preserving the declaration order from the WPS response.
+	outputsJSON, err := marshalOrderedObject(offering.Process.Outputs,
+		func(out wpsOutput) (string, any) { return out.Identifier.Value, wpsOutputToOGCAPI(out) })
 	if err != nil {
 		return nil, fmt.Errorf("encoding outputs schema: %w", err)
 	}
@@ -1792,20 +1811,13 @@ func parseWPS1ProcessDescription(body []byte, processID string) (*ProcessDescrip
 		jco = []string{"async-execute", "sync-execute"}
 	}
 
-	inputsMap := make(map[string]any, len(pd.DataInputs.Inputs))
-	for _, inp := range pd.DataInputs.Inputs {
-		inputsMap[inp.Identifier.Value] = wps1InputToOGCAPI(inp)
-	}
-	outputsMap := make(map[string]any, len(pd.ProcessOutputs.Outputs))
-	for _, out := range pd.ProcessOutputs.Outputs {
-		outputsMap[out.Identifier.Value] = wps1OutputToOGCAPI(out)
-	}
-
-	inputsJSON, err := json.Marshal(inputsMap)
+	inputsJSON, err := marshalOrderedObject(pd.DataInputs.Inputs,
+		func(inp wps1Input) (string, any) { return inp.Identifier.Value, wps1InputToOGCAPI(inp) })
 	if err != nil {
 		return nil, fmt.Errorf("encoding inputs schema: %w", err)
 	}
-	outputsJSON, err := json.Marshal(outputsMap)
+	outputsJSON, err := marshalOrderedObject(pd.ProcessOutputs.Outputs,
+		func(out wps1Output) (string, any) { return out.Identifier.Value, wps1OutputToOGCAPI(out) })
 	if err != nil {
 		return nil, fmt.Errorf("encoding outputs schema: %w", err)
 	}
