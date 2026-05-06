@@ -283,7 +283,7 @@ func marshalOutputValue(raw json.RawMessage) ([]byte, error) {
 	return []byte(raw), nil
 }
 
-// OGCAPIBackend implements ProcessingBackend for OGC API – Processes services.
+// OGCAPIBackend implements ProcessingBackend for OGC API - Processes services.
 // It delegates all HTTP communication to an OGCAPIClient.
 type OGCAPIBackend struct {
 	client *OGCAPIClient
@@ -354,7 +354,7 @@ func (b *OGCAPIBackend) DescribeProcess(ctx context.Context, service domain.Proc
 	return &desc, nil
 }
 
-// Execute submits a job to the remote OGC API – Processes endpoint and waits
+// Execute submits a job to the remote OGC API - Processes endpoint and waits
 // for it to complete. It returns the output results and the remote job ID.
 // The job parameter is present for interface compatibility; the backend does
 // not mutate it — mutation is the caller's responsibility.

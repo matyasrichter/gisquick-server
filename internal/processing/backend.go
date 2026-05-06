@@ -9,7 +9,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// ProcessDescription holds the structured fields of an OGC API – Processes
+// ProcessDescription holds the structured fields of an OGC API - Processes
 // process description document. It is used internally when reading
 // jobControlOptions at execution time to decide async vs. sync mode.
 // The Raw field retains the original JSON for pass-through serialisation.
@@ -24,7 +24,7 @@ type ProcessDescription struct {
 }
 
 // ProcessingBackend is the interface implemented by every processing backend
-// (OGC API – Processes, WPS, …). Handlers obtain a concrete implementation
+// (OGC API - Processes, WPS, …). Handlers obtain a concrete implementation
 // through NewBackend and call these three methods during the job lifecycle.
 type ProcessingBackend interface {
 	// FetchProcessList retrieves the list of available process summaries from

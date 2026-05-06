@@ -1183,7 +1183,7 @@ func buildWPSInputElement(id string, raw json.RawMessage) (wpsInputElement, erro
 		}
 
 	case []any:
-		// JSON array: bounding box if 4–6 numbers, otherwise ComplexData.
+		// JSON array: bounding box if 4-6 numbers, otherwise ComplexData.
 		if isBBoxArray(v) {
 			nums := make([]float64, len(v))
 			for i, n := range v {
@@ -1245,7 +1245,7 @@ func buildWPSInputElement(id string, raw json.RawMessage) (wpsInputElement, erro
 	return elem, nil
 }
 
-// isBBoxArray returns true when v is a JSON array of 4–6 float64 numbers.
+// isBBoxArray returns true when v is a JSON array of 4-6 float64 numbers.
 func isBBoxArray(v []any) bool {
 	if len(v) < 4 || len(v) > 6 {
 		return false
