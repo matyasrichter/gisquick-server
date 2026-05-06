@@ -102,6 +102,7 @@ type JobRecord struct {
 	Username     string     `json:"username,omitempty"`      // User who submitted the job
 	Status       string     `json:"status"`                  // Current job status
 	Message      string     `json:"message,omitempty"`       // Error or status message
+	Progress     *int       `json:"progress,omitempty"`      // Progress percentage 0-100, nil when not reported
 	StoragePath  string     `json:"storage_path,omitempty"`  // Absolute path to job directory on disk
 	ProjectFile  string     `json:"project_file,omitempty"`  // QGIS project filename within StoragePath
 	CreatedAt    time.Time  `json:"created_at"`

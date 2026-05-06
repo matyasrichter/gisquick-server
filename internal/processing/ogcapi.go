@@ -50,7 +50,7 @@ func (c *OGCAPIClient) ForwardRequest(method, url string, body io.Reader, header
 // Execute calls a remote OGC API Processes backend, handles both sync (200) and
 // async (201 + polling) responses, and returns the raw output results.
 // The caller is responsible for setting an appropriate deadline on ctx.
-func (c *OGCAPIClient) Execute(ctx context.Context, remote domain.RemoteConfig, payload []byte) (remoteJobID string, results []OutputResult, err error) {
+func (c *OGCAPIClient) Execute(ctx context.Context, remote domain.RemoteConfig, payload []byte, onProgress ProgressFunc) (remoteJobID string, results []OutputResult, err error) {
 	executeURL := remote.ExecuteURL
 	if executeURL == "" {
 		return "", nil, fmt.Errorf("remote.ExecuteURL is empty")
@@ -88,7 +88,7 @@ func (c *OGCAPIClient) Execute(ctx context.Context, remote domain.RemoteConfig, 
 		if statusURL == "" {
 			return "", nil, fmt.Errorf("async execute: no Location header and no StatusURL configured")
 		}
-		return c.pollAndFetch(ctx, statusURL, remote)
+		return c.pollAndFetch(ctx, statusURL, remote, onProgress)
 
 	default:
 		body, _ := io.ReadAll(resp.Body)
@@ -97,7 +97,7 @@ func (c *OGCAPIClient) Execute(ctx context.Context, remote domain.RemoteConfig, 
 }
 
 // pollAndFetch polls the status URL until the job succeeds or fails, then fetches results.
-func (c *OGCAPIClient) pollAndFetch(ctx context.Context, statusURL string, remote domain.RemoteConfig) (remoteJobID string, results []OutputResult, err error) {
+func (c *OGCAPIClient) pollAndFetch(ctx context.Context, statusURL string, remote domain.RemoteConfig, onProgress ProgressFunc) (remoteJobID string, results []OutputResult, err error) {
 	interval := initialPollInterval
 
 	for {
@@ -136,7 +136,10 @@ func (c *OGCAPIClient) pollAndFetch(ctx context.Context, statusURL string, remot
 			return status.JobID, nil, fmt.Errorf("remote job was dismissed")
 
 		default:
-			// accepted / running — keep polling with backoff
+			// accepted / running — report progress and keep polling with backoff
+			if onProgress != nil {
+				onProgress(status.Progress, status.Message)
+			}
 			interval *= 2
 			if interval > maxPollInterval {
 				interval = maxPollInterval
@@ -358,7 +361,7 @@ func (b *OGCAPIBackend) DescribeProcess(ctx context.Context, service domain.Proc
 // for it to complete. It returns the output results and the remote job ID.
 // The job parameter is present for interface compatibility; the backend does
 // not mutate it — mutation is the caller's responsibility.
-func (b *OGCAPIBackend) Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage) ([]OutputResult, string, error) {
+func (b *OGCAPIBackend) Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, onProgress ProgressFunc) ([]OutputResult, string, error) {
 	if procCfg, ok := service.Processes[job.ProcessID]; ok && len(procCfg.InputFormats) > 0 {
 		converted, err := transformInputs(inputs, procCfg.InputFormats, defaultRegistry)
 		if err != nil {
@@ -372,7 +375,7 @@ func (b *OGCAPIBackend) Execute(ctx context.Context, job *JobRecord, service dom
 		Type:       string(service.Type),
 		Headers:    service.Headers,
 	}
-	remoteJobID, results, err := b.client.Execute(ctx, remote, []byte(inputs))
+	remoteJobID, results, err := b.client.Execute(ctx, remote, []byte(inputs), onProgress)
 	return results, remoteJobID, err
 }
 

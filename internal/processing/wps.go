@@ -798,7 +798,7 @@ func (b *WPSBackend) DescribeProcess(ctx context.Context, service domain.Process
 // Execute submits an execution request to a WPS service (version 1.0 or 2.0),
 // waits for completion (polling for async, or parsing inline for sync), and
 // returns the output results together with the remote job ID.
-func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage) ([]OutputResult, string, error) {
+func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, onProgress ProgressFunc) ([]OutputResult, string, error) {
 	if procCfg, ok := service.Processes[job.ProcessID]; ok && len(procCfg.InputFormats) > 0 {
 		converted, err := transformInputs(inputs, procCfg.InputFormats, defaultRegistry)
 		if err != nil {
@@ -835,15 +835,15 @@ func (b *WPSBackend) Execute(ctx context.Context, job *JobRecord, service domain
 	}
 
 	if major == 1 {
-		return b.executeWPS1(ctx, job, service, inputs, mode, descJSON)
+		return b.executeWPS1(ctx, job, service, inputs, mode, descJSON, onProgress)
 	}
-	return b.executeWPS2(ctx, job, service, inputs, mode, descJSON)
+	return b.executeWPS2(ctx, job, service, inputs, mode, descJSON, onProgress)
 }
 
 // executeWPS1 handles the WPS 1.0 Execute path: builds the XML request,
 // POSTs it, and either parses an inline result (sync/immediate success) or
 // polls the statusLocation URL until the job reaches a terminal state.
-func (b *WPSBackend) executeWPS1(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, mode string, descJSON json.RawMessage) ([]OutputResult, string, error) {
+func (b *WPSBackend) executeWPS1(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, mode string, descJSON json.RawMessage, onProgress ProgressFunc) ([]OutputResult, string, error) {
 	outputIDs := wps1OutputIDs(descJSON)
 
 	xmlBody, err := b.buildWPS1ExecuteXML(job.ProcessID, mode, inputs, outputIDs, descJSON)
@@ -895,7 +895,7 @@ func (b *WPSBackend) executeWPS1(ctx context.Context, job *JobRecord, service do
 		}
 		return nil, "", fmt.Errorf("WPS 1.0 Execute failed: %s", msg)
 	case statusLocation != "":
-		results, err := b.wps1PollAndFetch(ctx, service, statusLocation)
+		results, err := b.wps1PollAndFetch(ctx, service, statusLocation, onProgress)
 		return results, statusLocation, err
 	default:
 		return nil, "", fmt.Errorf("WPS 1.0 ExecuteResponse has no statusLocation and no terminal status")
@@ -905,7 +905,7 @@ func (b *WPSBackend) executeWPS1(ctx context.Context, job *JobRecord, service do
 // executeWPS2 handles the WPS 2.0.2 Execute path: builds the XML request,
 // POSTs it, and either parses an inline Result (sync) or polls GetStatus until
 // the job succeeds or fails, then fetches GetResult.
-func (b *WPSBackend) executeWPS2(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, mode string, descJSON json.RawMessage) ([]OutputResult, string, error) {
+func (b *WPSBackend) executeWPS2(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, mode string, descJSON json.RawMessage, onProgress ProgressFunc) ([]OutputResult, string, error) {
 	xmlBody, err := b.buildExecuteXML(job.ProcessID, mode, inputs, descJSON)
 	if err != nil {
 		return nil, "", fmt.Errorf("building WPS Execute XML: %w", err)
@@ -944,7 +944,7 @@ func (b *WPSBackend) executeWPS2(ctx context.Context, job *JobRecord, service do
 		if err := xml.Unmarshal(body, &si); err != nil {
 			return nil, "", fmt.Errorf("parsing WPS StatusInfo: %w", err)
 		}
-		results, err := b.wpsPollAndFetch(ctx, service, si.JobID)
+		results, err := b.wpsPollAndFetch(ctx, service, si.JobID, onProgress)
 		return results, si.JobID, err
 	case "Result":
 		results, err := b.parseWPSResult(body)
@@ -1025,7 +1025,7 @@ func wps1OutputToResult(out wps1OutputResult) (OutputResult, error) {
 }
 
 // wps1PollAndFetch polls the statusLocation URL until the WPS 1.0 job completes.
-func (b *WPSBackend) wps1PollAndFetch(ctx context.Context, service domain.ProcessingService, statusLocation string) ([]OutputResult, error) {
+func (b *WPSBackend) wps1PollAndFetch(ctx context.Context, service domain.ProcessingService, statusLocation string, onProgress ProgressFunc) ([]OutputResult, error) {
 	interval := b.pollInterval
 	if interval == 0 {
 		interval = initialPollInterval
@@ -1079,6 +1079,14 @@ func (b *WPSBackend) wps1PollAndFetch(ctx context.Context, service domain.Proces
 			}
 			return nil, fmt.Errorf("WPS 1.0 job failed: %s", msg)
 		default:
+			if onProgress != nil {
+				if execResp.Status.ProcessStarted != nil {
+					pct := execResp.Status.ProcessStarted.PercentCompleted
+					onProgress(&pct, execResp.Status.ProcessStarted.Value)
+				} else {
+					onProgress(nil, "")
+				}
+			}
 			interval *= 2
 			if interval > maxPollInterval {
 				interval = maxPollInterval
@@ -1274,7 +1282,7 @@ func wpsRootElementName(buf []byte) string {
 
 // wpsPollAndFetch polls GetStatus until the job succeeds or fails, then calls
 // GetResult and parses the output.
-func (b *WPSBackend) wpsPollAndFetch(ctx context.Context, service domain.ProcessingService, jobID string) ([]OutputResult, error) {
+func (b *WPSBackend) wpsPollAndFetch(ctx context.Context, service domain.ProcessingService, jobID string, onProgress ProgressFunc) ([]OutputResult, error) {
 	interval := b.pollInterval
 	if interval == 0 {
 		interval = initialPollInterval
@@ -1322,7 +1330,10 @@ func (b *WPSBackend) wpsPollAndFetch(ctx context.Context, service domain.Process
 		case "Failed", "Dismissed":
 			return nil, fmt.Errorf("WPS job %s: status=%s", jobID, si.Status)
 		default:
-			// Accepted / Running — backoff and retry.
+			// Accepted / Running — WPS 2.0 StatusInfo has no PercentCompleted field.
+			if onProgress != nil {
+				onProgress(nil, "")
+			}
 			interval *= 2
 			if interval > maxPollInterval {
 				interval = maxPollInterval

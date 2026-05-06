@@ -36,9 +36,16 @@ type ProcessingBackend interface {
 
 	// Execute submits an execution request and waits for it to complete (polling
 	// as needed). It returns the output results, the remote job ID (empty for
-	// synchronous responses), and any error.
-	Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage) (results []OutputResult, remoteJobID string, err error)
+	// synchronous responses), and any error. onProgress is called on each
+	// intermediate status poll with the current progress (nil if not reported)
+	// and message; it may be nil if the caller does not need progress updates.
+	Execute(ctx context.Context, job *JobRecord, service domain.ProcessingService, inputs json.RawMessage, onProgress ProgressFunc) (results []OutputResult, remoteJobID string, err error)
 }
+
+// ProgressFunc is called by a backend's polling loop on each intermediate
+// status update. progress is nil when the remote service does not report a
+// percentage. Implementations must be safe to call from a background goroutine.
+type ProgressFunc func(progress *int, message string)
 
 // NewBackend returns the appropriate ProcessingBackend implementation for the
 // given service type. Returns nil for unknown service types — callers must

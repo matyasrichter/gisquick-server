@@ -286,7 +286,7 @@ func TestWPSExecuteAsync(t *testing.T) {
 	}
 	inputs := json.RawMessage(`{"inputs":{"distance":100}}`)
 
-	results, remoteJobID, err := backend.Execute(context.Background(), job, svc, inputs)
+	results, remoteJobID, err := backend.Execute(context.Background(), job, svc, inputs, nil)
 	if err != nil {
 		t.Fatalf("Execute returned error: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestWPSExecuteSync(t *testing.T) {
 	}
 	inputs := json.RawMessage(`{"inputs":{"distance":100}}`)
 
-	results, remoteJobID, err := backend.Execute(context.Background(), job, svc, inputs)
+	results, remoteJobID, err := backend.Execute(context.Background(), job, svc, inputs, nil)
 	if err != nil {
 		t.Fatalf("Execute (sync) returned error: %v", err)
 	}
@@ -424,7 +424,7 @@ func TestWPSExecuteFailure(t *testing.T) {
 	}
 	inputs := json.RawMessage(`{"inputs":{"distance":100}}`)
 
-	_, _, err := backend.Execute(context.Background(), job, svc, inputs)
+	_, _, err := backend.Execute(context.Background(), job, svc, inputs, nil)
 	if err == nil {
 		t.Fatal("expected an error for Failed job, got nil")
 	}
@@ -753,7 +753,7 @@ func TestWPS1ExecuteAsync(t *testing.T) {
 	job := &JobRecord{ProcessID: "buffer"}
 	inputs := json.RawMessage(`{"inputs":{"distance":10.0}}`)
 
-	results, remoteID, err := backend.Execute(context.Background(), job, service, inputs)
+	results, remoteID, err := backend.Execute(context.Background(), job, service, inputs, nil)
 	require.NoError(t, err)
 	assert.NotEmpty(t, remoteID) // statusLocation URL
 	require.Len(t, results, 1)
@@ -812,7 +812,7 @@ func TestWPS1ExecuteSync(t *testing.T) {
 
 	job := &JobRecord{ProcessID: "info"}
 	inputs := json.RawMessage(`{"inputs":{}}`)
-	results, remoteID, err := backend.Execute(context.Background(), job, service, inputs)
+	results, remoteID, err := backend.Execute(context.Background(), job, service, inputs, nil)
 	require.NoError(t, err)
 	assert.Empty(t, remoteID)
 	require.Len(t, results, 1)
@@ -878,7 +878,7 @@ func TestWPS1ExecuteFailure(t *testing.T) {
 		},
 	}
 
-	_, _, err := backend.Execute(context.Background(), &JobRecord{ProcessID: "proc"}, service, json.RawMessage(`{"inputs":{}}`))
+	_, _, err := backend.Execute(context.Background(), &JobRecord{ProcessID: "proc"}, service, json.RawMessage(`{"inputs":{}}`), nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "out of memory")
 }

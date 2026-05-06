@@ -625,8 +625,14 @@ func (h *Handlers) runJob(projectName, jobID, base string, svc domain.Processing
 		return
 	}
 
-	// 2. Execute against the remote backend.
-	results, remoteJobID, err := backend.Execute(ctx, record, svc, json.RawMessage(payload))
+	// 2. Execute against the remote backend, saving intermediate progress to Redis.
+	results, remoteJobID, err := backend.Execute(ctx, record, svc, json.RawMessage(payload), func(progress *int, message string) {
+		record.Progress = progress
+		record.Message = message
+		if saveErr := h.jobs.Save(ctx, record); saveErr != nil {
+			h.log.Warnw("saving job progress", "jobID", jobID, zap.Error(saveErr))
+		}
+	})
 	if err != nil {
 		h.log.Errorw("executing process", "process", processID, "jobID", jobID, zap.Error(err))
 		h.failJob(ctx, projectName, jobID, err.Error())
@@ -718,6 +724,7 @@ func (h *Handlers) HandleJobStatus() echo.HandlerFunc {
 			Type:      "process",
 			Status:    record.Status,
 			Message:   record.Message,
+			Progress:  record.Progress,
 			Created:   &record.CreatedAt,
 			Finished:  record.FinishedAt,
 			Links:     links,
