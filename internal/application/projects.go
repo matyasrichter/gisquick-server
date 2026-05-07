@@ -852,6 +852,10 @@ func (s *projectService) GetMapConfig(projectName string, user domain.User) (map
 		}
 	}
 	data["topics"] = topics
+	processingConfig, err := s.repo.GetProcessingConfig(projectName)
+	if err == nil && len(processingConfig.Services) > 0 {
+		data["processing"] = true
+	}
 	if settings.Geocoding != nil || settings.SearchByLocation {
 		search := SearchConfig{SearchByLocation: settings.SearchByLocation}
 		if settings.Geocoding != nil {
