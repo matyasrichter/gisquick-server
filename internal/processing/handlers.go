@@ -653,7 +653,7 @@ func (h *Handlers) runJob(projectName, jobID, base string, svc domain.Processing
 	if len(artifacts) > 0 {
 		projectFile, err = h.qgisPlugin.CreateProject(ctx, relJobDir, jobBase+"/ows", artifacts)
 		if err != nil {
-			h.log.Warnw("QGIS plugin gisquick-project-from-file failed (WMS/WFS unavailable)", "jobID", jobID, zap.Error(err))
+			h.log.Warnw("QGIS plugin gisquick-qgis-server-processing failed (WMS/WFS unavailable)", "jobID", jobID, zap.Error(err))
 		}
 	}
 
