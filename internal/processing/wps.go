@@ -1097,7 +1097,7 @@ func (b *WPSBackend) wps1PollAndFetch(ctx context.Context, service domain.Proces
 					onProgress(nil, "")
 				}
 			}
-			interval *= 2
+			interval = time.Duration(float64(interval) * backoffMultiplier)
 			if interval > maxPollInterval {
 				interval = maxPollInterval
 			}
@@ -1346,7 +1346,7 @@ func (b *WPSBackend) wpsPollAndFetch(ctx context.Context, service domain.Process
 			if onProgress != nil {
 				onProgress(nil, "")
 			}
-			interval *= 2
+			interval = time.Duration(float64(interval) * backoffMultiplier)
 			if interval > maxPollInterval {
 				interval = maxPollInterval
 			}

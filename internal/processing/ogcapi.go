@@ -17,6 +17,7 @@ import (
 const (
 	maxPollInterval     = 30 * time.Second
 	initialPollInterval = 1 * time.Second
+	backoffMultiplier   = 1.25
 )
 
 // OGCAPIClient handles direct HTTP communication with OGC API Processes backends.
@@ -146,7 +147,7 @@ func (c *OGCAPIClient) pollAndFetch(ctx context.Context, statusURL string, remot
 			if onProgress != nil {
 				onProgress(status.Progress, status.Message)
 			}
-			interval *= 2
+			interval = time.Duration(float64(interval) * backoffMultiplier)
 			if interval > maxPollInterval {
 				interval = maxPollInterval
 			}
