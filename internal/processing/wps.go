@@ -668,6 +668,7 @@ func (b *WPSBackend) FetchProcessList(ctx context.Context, service domain.Proces
 		req.Header.Set(k, v)
 	}
 
+	b.log.Debugw("WPS request", "method", http.MethodGet, "url", capsURL)
 	resp, err := b.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("WPS GetCapabilities: %w", err)
@@ -683,6 +684,7 @@ func (b *WPSBackend) FetchProcessList(ctx context.Context, service domain.Proces
 	if err != nil {
 		return nil, fmt.Errorf("reading WPS GetCapabilities body: %w", err)
 	}
+	b.log.Debugw("WPS response", "url", capsURL, "status", resp.StatusCode, "body", string(body))
 
 	major, err := wpsDetectMajorVersion(body)
 	if err != nil {
@@ -720,6 +722,7 @@ func (b *WPSBackend) DescribeProcess(ctx context.Context, service domain.Process
 		req.Header.Set(k, v)
 	}
 
+	b.log.Debugw("WPS request", "method", http.MethodGet, "url", descURL)
 	resp, err := b.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("WPS DescribeProcess: %w", err)
@@ -735,6 +738,7 @@ func (b *WPSBackend) DescribeProcess(ctx context.Context, service domain.Process
 	if err != nil {
 		return nil, fmt.Errorf("reading WPS DescribeProcess body: %w", err)
 	}
+	b.log.Debugw("WPS response", "url", descURL, "status", resp.StatusCode, "body", string(body))
 
 	b.log.Debugw("WPS DescribeProcess", "service", service.URL, "processID", processID, "majorVersion", major)
 
@@ -852,6 +856,7 @@ func (b *WPSBackend) executeWPS1(ctx context.Context, job *JobRecord, service do
 	}
 
 	executeURL := service.URL + "?service=WPS&version=1.0.0&request=Execute"
+	b.log.Debugw("WPS request", "method", http.MethodPost, "url", executeURL, "body", string(xmlBody))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, executeURL, bytes.NewReader(xmlBody))
 	if err != nil {
 		return nil, "", fmt.Errorf("building WPS 1.0 Execute HTTP request: %w", err)
@@ -876,6 +881,7 @@ func (b *WPSBackend) executeWPS1(ctx context.Context, job *JobRecord, service do
 	if err != nil {
 		return nil, "", fmt.Errorf("reading WPS 1.0 Execute response: %w", err)
 	}
+	b.log.Debugw("WPS response", "url", executeURL, "status", resp.StatusCode, "body", string(body))
 
 	execResp, err := parseWPS1ExecuteResponse(body)
 	if err != nil {
@@ -912,6 +918,7 @@ func (b *WPSBackend) executeWPS2(ctx context.Context, job *JobRecord, service do
 	}
 
 	executeURL := service.URL + "?service=WPS&version=2.0.0&request=Execute"
+	b.log.Debugw("WPS request", "method", http.MethodPost, "url", executeURL, "body", string(xmlBody))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, executeURL, bytes.NewReader(xmlBody))
 	if err != nil {
 		return nil, "", fmt.Errorf("building WPS Execute HTTP request: %w", err)
@@ -936,6 +943,7 @@ func (b *WPSBackend) executeWPS2(ctx context.Context, job *JobRecord, service do
 	if err != nil {
 		return nil, "", fmt.Errorf("reading WPS Execute response body: %w", err)
 	}
+	b.log.Debugw("WPS response", "url", executeURL, "status", resp.StatusCode, "body", string(body))
 
 	rootName := wpsRootElementName(body)
 	switch rootName {
@@ -1046,6 +1054,7 @@ func (b *WPSBackend) wps1PollAndFetch(ctx context.Context, service domain.Proces
 			req.Header.Set(k, v)
 		}
 
+		b.log.Debugw("WPS request", "method", http.MethodGet, "url", statusLocation)
 		resp, err := b.client.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("WPS 1.0 status poll: %w", err)
@@ -1055,6 +1064,7 @@ func (b *WPSBackend) wps1PollAndFetch(ctx context.Context, service domain.Proces
 		if readErr != nil {
 			return nil, fmt.Errorf("reading WPS 1.0 status response: %w", readErr)
 		}
+		b.log.Debugw("WPS response", "url", statusLocation, "status", resp.StatusCode, "body", string(body))
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return nil, fmt.Errorf("WPS 1.0 status poll returned status %d: %s", resp.StatusCode, string(body))
 		}
@@ -1304,6 +1314,7 @@ func (b *WPSBackend) wpsPollAndFetch(ctx context.Context, service domain.Process
 			req.Header.Set(k, v)
 		}
 
+		b.log.Debugw("WPS request", "method", http.MethodGet, "url", statusURL)
 		resp, err := b.client.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("WPS GetStatus: %w", err)
@@ -1313,6 +1324,7 @@ func (b *WPSBackend) wpsPollAndFetch(ctx context.Context, service domain.Process
 		if readErr != nil {
 			return nil, fmt.Errorf("reading GetStatus body: %w", readErr)
 		}
+		b.log.Debugw("WPS response", "url", statusURL, "status", resp.StatusCode, "body", string(body))
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return nil, fmt.Errorf("WPS GetStatus returned status %d: %s", resp.StatusCode, string(body))
 		}
@@ -1353,6 +1365,7 @@ func (b *WPSBackend) wpsGetResult(ctx context.Context, service domain.Processing
 		req.Header.Set(k, v)
 	}
 
+	b.log.Debugw("WPS request", "method", http.MethodGet, "url", resultURL)
 	resp, err := b.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("WPS GetResult: %w", err)
@@ -1363,6 +1376,7 @@ func (b *WPSBackend) wpsGetResult(ctx context.Context, service domain.Processing
 	if err != nil {
 		return nil, fmt.Errorf("reading GetResult body: %w", err)
 	}
+	b.log.Debugw("WPS response", "url", resultURL, "status", resp.StatusCode, "body", string(body))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("WPS GetResult returned status %d: %s", resp.StatusCode, string(body))
 	}

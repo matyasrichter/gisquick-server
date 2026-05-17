@@ -1,6 +1,7 @@
 package processing
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -56,6 +57,7 @@ func (c *OGCAPIClient) Execute(ctx context.Context, remote domain.RemoteConfig, 
 		return "", nil, fmt.Errorf("remote.ExecuteURL is empty")
 	}
 
+	c.log.Debugw("OGC request", "method", http.MethodPost, "url", executeURL, "body", string(payload))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, executeURL, strings.NewReader(string(payload)))
 	if err != nil {
 		return "", nil, fmt.Errorf("building execute request: %w", err)
@@ -76,12 +78,15 @@ func (c *OGCAPIClient) Execute(ctx context.Context, remote domain.RemoteConfig, 
 	switch resp.StatusCode {
 	case http.StatusOK:
 		// Synchronous response — results are in the body.
-		results, err = c.parseResultsBody(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
+		c.log.Debugw("OGC response", "url", executeURL, "status", resp.StatusCode, "body", string(body))
+		results, err = c.parseResultsBody(bytes.NewReader(body))
 		return "", results, err
 
 	case http.StatusCreated:
 		// Asynchronous — poll the Location URL.
 		statusURL := resp.Header.Get("Location")
+		c.log.Debugw("OGC response", "url", executeURL, "status", resp.StatusCode, "location", statusURL)
 		if statusURL == "" {
 			statusURL = remote.StatusURL
 		}
@@ -92,6 +97,7 @@ func (c *OGCAPIClient) Execute(ctx context.Context, remote domain.RemoteConfig, 
 
 	default:
 		body, _ := io.ReadAll(resp.Body)
+		c.log.Debugw("OGC response", "url", executeURL, "status", resp.StatusCode, "body", string(body))
 		return "", nil, fmt.Errorf("execute returned status %d: %s", resp.StatusCode, string(body))
 	}
 }
@@ -159,19 +165,24 @@ func (c *OGCAPIClient) fetchStatus(ctx context.Context, statusURL string, header
 		req.Header.Set(k, v)
 	}
 
+	c.log.Debugw("OGC request", "method", http.MethodGet, "url", statusURL)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading status response: %w", err)
+	}
+	c.log.Debugw("OGC response", "url", statusURL, "status", resp.StatusCode, "body", string(body))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("status endpoint returned %d: %s", resp.StatusCode, string(body))
 	}
 
 	var status OGCStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+	if err := json.Unmarshal(body, &status); err != nil {
 		return nil, fmt.Errorf("decoding status response: %w", err)
 	}
 	return &status, nil
@@ -188,18 +199,23 @@ func (c *OGCAPIClient) fetchResults(ctx context.Context, resultsURL string, head
 		req.Header.Set(k, v)
 	}
 
+	c.log.Debugw("OGC request", "method", http.MethodGet, "url", resultsURL)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching results: %w", err)
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading results body: %w", err)
+	}
+	c.log.Debugw("OGC response", "url", resultsURL, "status", resp.StatusCode, "body", string(body))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("results endpoint returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	return c.parseResultsBody(resp.Body)
+	return c.parseResultsBody(bytes.NewReader(body))
 }
 
 // parseResultsBody parses the OGC API results document.
@@ -304,18 +320,24 @@ func (b *OGCAPIBackend) FetchProcessList(ctx context.Context, service domain.Pro
 	for k, v := range service.Headers {
 		req.Header.Set(k, v)
 	}
+	b.client.log.Debugw("OGC request", "method", http.MethodGet, "url", req.URL.String())
 	resp, err := b.client.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching process list: %w", err)
 	}
 	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading process list body: %w", err)
+	}
+	b.client.log.Debugw("OGC response", "url", req.URL.String(), "status", resp.StatusCode, "body", string(body))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("process list returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var list ProcessList
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+	if err := json.Unmarshal(body, &list); err != nil {
 		return nil, fmt.Errorf("decoding process list: %w", err)
 	}
 	return list.Processes, nil
@@ -334,19 +356,20 @@ func (b *OGCAPIBackend) DescribeProcess(ctx context.Context, service domain.Proc
 	for k, v := range service.Headers {
 		req.Header.Set(k, v)
 	}
+	b.client.log.Debugw("OGC request", "method", http.MethodGet, "url", req.URL.String())
 	resp, err := b.client.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetching process description for %q: %w", processID, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("process description for %q returned status %d: %s", processID, resp.StatusCode, string(body))
-	}
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading process description for %q: %w", processID, err)
+	}
+	b.client.log.Debugw("OGC response", "url", req.URL.String(), "status", resp.StatusCode, "body", string(raw))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("process description for %q returned status %d: %s", processID, resp.StatusCode, string(raw))
 	}
 
 	var desc ProcessDescription
